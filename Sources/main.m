@@ -317,6 +317,41 @@ static BOOL CAIsNotificationsNotAllowedError(NSError *error) {
 
 @implementation AppDelegate
 
+- (NSImage *)menuBarIconImage {
+    NSImage *image = [NSImage imageNamed:@"MenuBarIcon"];
+    if (!image) {
+        NSString *path = [[NSBundle mainBundle] pathForResource:@"MenuBarIcon" ofType:@"png"];
+        if (path) {
+            image = [[NSImage alloc] initWithContentsOfFile:path];
+        }
+    }
+    if (!image) return nil;
+
+    image.size = NSMakeSize(18, 18);
+    image.template = NO;
+    return image;
+}
+
+- (NSString *)menuBarUsageTitle {
+    for (CAAccount *account in self.accounts) {
+        if (account.active) {
+            NSArray<NSString *> *parts = [account.usage5h componentsSeparatedByString:@" "];
+            NSString *usage = parts.count > 0 ? parts[0] : account.usage5h;
+            return usage;
+        }
+    }
+    return @"--%";
+}
+
+- (void)updateStatusItemButton {
+    NSStatusBarButton *button = self.statusItem.button;
+    if (!button) return;
+
+    button.image = [self menuBarIconImage];
+    button.imagePosition = NSImageLeft;
+    button.title = [self menuBarUsageTitle];
+}
+
 - (void)applicationDidFinishLaunching:(NSNotification *)notification {
     self.manager = [[CodexAuthManager alloc] init];
     self.status = [[CAStatusSnapshot alloc] init];
@@ -324,7 +359,7 @@ static BOOL CAIsNotificationsNotAllowedError(NSError *error) {
     self.notificationStatus = CANotificationStatusNotDetermined;
     self.pollInterval = [self loadPollInterval];
     self.statusItem = [[NSStatusBar systemStatusBar] statusItemWithLength:NSVariableStatusItemLength];
-    self.statusItem.button.title = @"CA";
+    [self updateStatusItemButton];
 
     [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
     [self rebuildMenu];
@@ -441,14 +476,7 @@ static BOOL CAIsNotificationsNotAllowedError(NSError *error) {
 }
 
 - (NSString *)menuBarTitle {
-    for (CAAccount *account in self.accounts) {
-        if (account.active) {
-            NSArray<NSString *> *parts = [account.usage5h componentsSeparatedByString:@" "];
-            NSString *usage = parts.count > 0 ? parts[0] : account.usage5h;
-            return [NSString stringWithFormat:@"CA %@", usage];
-        }
-    }
-    return @"CA";
+    return [self menuBarUsageTitle];
 }
 
 - (void)addStaticItem:(NSString *)title toMenu:(NSMenu *)menu {
@@ -839,7 +867,7 @@ static BOOL CAIsNotificationsNotAllowedError(NSError *error) {
 }
 
 - (void)rebuildMenu {
-    self.statusItem.button.title = [self menuBarTitle];
+    [self updateStatusItemButton];
     NSMenu *menu = [[NSMenu alloc] init];
     CAAccount *active = nil;
     for (CAAccount *account in self.accounts) {
