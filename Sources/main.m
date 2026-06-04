@@ -3,6 +3,24 @@
 
 static NSString *const CAFixedBinaryPath = @"/usr/local/bin/codex-auth";
 static NSString *const CAFixedNodePath = @"/usr/local/bin/node";
+
+static NSString *CAResolvePath(NSString *command) {
+    NSTask *task = [[NSTask alloc] init];
+    task.launchPath = @"/bin/zsh";
+    task.arguments = @[@"-l", @"-c", [NSString stringWithFormat:@"command -v %@", command]];
+    NSPipe *pipe = [NSPipe pipe];
+    task.standardOutput = pipe;
+    task.standardError = [NSPipe pipe];
+    [task launch];
+    [task waitUntilExit];
+    NSData *data = [[pipe fileHandleForReading] readDataToEndOfFile];
+    NSString *path = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+    path = [path stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (path.length == 0) return nil;
+    BOOL isDir = NO;
+    if (![[NSFileManager defaultManager] fileExistsAtPath:path isDirectory:&isDir] || isDir) return nil;
+    return path;
+}
 static NSString *const CADefaultPollIntervalKey = @"pollIntervalSeconds";
 static NSString *const CANotificationDedupKey = @"notificationDedupByAccount";
 
@@ -71,6 +89,19 @@ static BOOL CAIsNotificationsNotAllowedError(NSError *error) {
     if (self) {
         _binaryPath = CAFixedBinaryPath;
         _nodePath = CAFixedNodePath;
+
+        BOOL binaryExists = [[NSFileManager defaultManager] fileExistsAtPath:_binaryPath];
+        BOOL nodeExists = [[NSFileManager defaultManager] fileExistsAtPath:_nodePath];
+
+        if (!binaryExists) {
+            NSString *resolved = CAResolvePath(@"codex-auth");
+            if (resolved) _binaryPath = resolved;
+        }
+
+        if (!nodeExists) {
+            NSString *resolved = CAResolvePath(@"node");
+            if (resolved) _nodePath = resolved;
+        }
     }
     return self;
 }
