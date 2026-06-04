@@ -25,8 +25,8 @@ open ./CodexAuthMenu.app
 
 ## Requirements
 
-- Node.js 22
-- `codex-auth` lives at `/usr/local/bin/codex-auth`
+- Node.js 22 (via `/usr/local/bin/node` or nvm)
+- `codex-auth` installed globally (`/usr/local/bin/codex-auth` or anywhere on `$PATH`)
 - macOS 13+
 - Xcode Command Line Tools with `clang`
 
