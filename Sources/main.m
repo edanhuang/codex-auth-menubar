@@ -1,10 +1,41 @@
 #import <Cocoa/Cocoa.h>
 #import <UserNotifications/UserNotifications.h>
+#import <CoreFoundation/CFDictionary.h>
 
-static NSString *const CAFixedBinaryPath = @"/usr/local/bin/codex-auth";
-static NSString *const CAFixedNodePath = @"/usr/local/bin/node";
+static NSString *const CAErrorDomain = @"CodexAuthMenu";
 static NSString *const CADefaultPollIntervalKey = @"pollIntervalSeconds";
 static NSString *const CANotificationDedupKey = @"notificationDedupByAccount";
+static NSString *const CACliName = @"codex-auth";
+static NSString *const CANodeName = @"node";
+static const NSTimeInterval CADefaultPollInterval = 300.0;
+static const CGFloat CAMenuBarIconSize = 18.0;
+static const CGFloat CASwitchAccountTabLocation = 320.0;
+static const CGFloat CAAlignedMenuTabLocation = 230.0;
+
+static const CGFloat CATagBgRedHigh = 0.92;
+static const CGFloat CATagBgGreenHigh = 0.94;
+static const CGFloat CATagBgBlueHigh = 0.93;
+static const CGFloat CATagFgRedHigh = 0.28;
+static const CGFloat CATagFgGreenHigh = 0.40;
+static const CGFloat CATagFgBlueHigh = 0.33;
+static const CGFloat CATagBgRedMedium = 0.95;
+static const CGFloat CATagBgGreenMedium = 0.93;
+static const CGFloat CATagBgBlueMedium = 0.88;
+static const CGFloat CATagFgRedMedium = 0.51;
+static const CGFloat CATagFgGreenMedium = 0.42;
+static const CGFloat CATagFgBlueMedium = 0.18;
+static const CGFloat CATagBgRedLow = 0.95;
+static const CGFloat CATagBgGreenLow = 0.91;
+static const CGFloat CATagBgBlueLow = 0.91;
+static const CGFloat CATagFgRedLow = 0.56;
+static const CGFloat CATagFgGreenLow = 0.25;
+static const CGFloat CATagFgBlueLow = 0.25;
+static const CGFloat CAPlanTagFgRed = 0.24;
+static const CGFloat CAPlanTagFgGreen = 0.30;
+static const CGFloat CAPlanTagFgBlue = 0.40;
+static const CGFloat CAPlanTagBgRed = 0.90;
+static const CGFloat CAPlanTagBgGreen = 0.92;
+static const CGFloat CAPlanTagBgBlue = 0.96;
 
 typedef NS_ENUM(NSInteger, CANotificationStatus) {
     CANotificationStatusNotDetermined = 0,
@@ -56,23 +87,48 @@ static BOOL CAIsNotificationsNotAllowedError(NSError *error) {
 @interface CodexAuthManager : NSObject
 @property(nonatomic, copy, readonly) NSString *binaryPath;
 @property(nonatomic, copy, readonly) NSString *nodePath;
+- (instancetype)initWithBinaryPath:(NSString *)binaryPath nodePath:(NSString *)nodePath;
 - (BOOL)validateBinary:(NSError **)error;
 - (NSDictionary *)fetchSnapshot:(NSError **)error;
 - (BOOL)switchAccount:(NSString *)account error:(NSError **)error;
 - (BOOL)setAutoSwitchEnabled:(BOOL)enabled error:(NSError **)error;
 - (BOOL)openInTerminal:(NSError **)error;
 - (BOOL)startLoginInTerminal:(NSError **)error;
++ (NSString *)resolvePathForCommand:(NSString *)command;
 @end
 
 @implementation CodexAuthManager
 
-- (instancetype)init {
++ (NSString *)resolvePathForCommand:(NSString *)command {
+    NSTask *task = [[NSTask alloc] init];
+    task.launchPath = @"/bin/zsh";
+    task.arguments = @[ @"-l", @"-c", [NSString stringWithFormat:@"which %@", command] ];
+    NSPipe *pipe = [NSPipe pipe];
+    task.standardOutput = pipe;
+    task.standardError = [NSPipe pipe];
+    @try {
+        [task launch];
+        [task waitUntilExit];
+    } @catch (NSException *exception) {
+        return nil;
+    }
+    if (task.terminationStatus != 0) return nil;
+    NSData *data = [[pipe fileHandleForReading] readDataToEndOfFile];
+    NSString *path = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+    return [path stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+}
+
+- (instancetype)initWithBinaryPath:(NSString *)binaryPath nodePath:(NSString *)nodePath {
     self = [super init];
     if (self) {
-        _binaryPath = CAFixedBinaryPath;
-        _nodePath = CAFixedNodePath;
+        _binaryPath = binaryPath ?: [CodexAuthManager resolvePathForCommand:CACliName];
+        _nodePath = nodePath ?: [CodexAuthManager resolvePathForCommand:CANodeName];
     }
     return self;
+}
+
+- (instancetype)init {
+    return [self initWithBinaryPath:nil nodePath:nil];
 }
 
 - (BOOL)validateBinary:(NSError **)error {
@@ -80,7 +136,7 @@ static BOOL CAIsNotificationsNotAllowedError(NSError *error) {
     BOOL exists = [[NSFileManager defaultManager] fileExistsAtPath:self.binaryPath isDirectory:&isDirectory];
     if (!exists || isDirectory) {
         if (error) {
-            *error = [NSError errorWithDomain:@"CodexAuthMenu"
+            *error = [NSError errorWithDomain:CAErrorDomain
                                          code:10
                                      userInfo:@{NSLocalizedDescriptionKey:
                                                     [NSString stringWithFormat:@"CLI not found at %@", self.binaryPath]}];
@@ -90,7 +146,7 @@ static BOOL CAIsNotificationsNotAllowedError(NSError *error) {
 
     if (![[NSFileManager defaultManager] isExecutableFileAtPath:self.binaryPath]) {
         if (error) {
-            *error = [NSError errorWithDomain:@"CodexAuthMenu"
+            *error = [NSError errorWithDomain:CAErrorDomain
                                          code:11
                                      userInfo:@{NSLocalizedDescriptionKey:
                                                     [NSString stringWithFormat:@"CLI is not executable: %@", self.binaryPath]}];
@@ -102,7 +158,7 @@ static BOOL CAIsNotificationsNotAllowedError(NSError *error) {
     BOOL nodeExists = [[NSFileManager defaultManager] fileExistsAtPath:self.nodePath isDirectory:&nodeIsDirectory];
     if (!nodeExists || nodeIsDirectory) {
         if (error) {
-            *error = [NSError errorWithDomain:@"CodexAuthMenu"
+            *error = [NSError errorWithDomain:CAErrorDomain
                                          code:12
                                      userInfo:@{NSLocalizedDescriptionKey:
                                                     [NSString stringWithFormat:@"Node not found at %@", self.nodePath]}];
@@ -112,7 +168,7 @@ static BOOL CAIsNotificationsNotAllowedError(NSError *error) {
 
     if (![[NSFileManager defaultManager] isExecutableFileAtPath:self.nodePath]) {
         if (error) {
-            *error = [NSError errorWithDomain:@"CodexAuthMenu"
+            *error = [NSError errorWithDomain:CAErrorDomain
                                          code:13
                                      userInfo:@{NSLocalizedDescriptionKey:
                                                     [NSString stringWithFormat:@"Node is not executable: %@", self.nodePath]}];
@@ -155,7 +211,7 @@ static BOOL CAIsNotificationsNotAllowedError(NSError *error) {
     [appleScript executeAndReturnError:&scriptError];
     if (scriptError) {
         if (error) {
-            *error = [NSError errorWithDomain:@"CodexAuthMenu"
+            *error = [NSError errorWithDomain:CAErrorDomain
                                          code:3
                                      userInfo:@{NSLocalizedDescriptionKey:
                                                     [NSString stringWithFormat:@"Failed to open Terminal: %@", scriptError]}];
@@ -176,7 +232,7 @@ static BOOL CAIsNotificationsNotAllowedError(NSError *error) {
     [appleScript executeAndReturnError:&scriptError];
     if (scriptError) {
         if (error) {
-            *error = [NSError errorWithDomain:@"CodexAuthMenu"
+            *error = [NSError errorWithDomain:CAErrorDomain
                                          code:14
                                      userInfo:@{NSLocalizedDescriptionKey:
                                                     [NSString stringWithFormat:@"Failed to start login in Terminal: %@", scriptError]}];
@@ -186,13 +242,34 @@ static BOOL CAIsNotificationsNotAllowedError(NSError *error) {
     return YES;
 }
 
+- (NSString *)systemProxyURL {
+    NSDictionary *services = (__bridge_transfer NSDictionary *)CFNetworkCopySystemProxySettings();
+    if (!services) return nil;
+    NSNumber *httpEnable = services[(__bridge NSString *)kCFNetworkProxiesHTTPEnable];
+    if (![httpEnable boolValue]) return nil;
+    NSString *host = services[(__bridge NSString *)kCFNetworkProxiesHTTPProxy];
+    NSNumber *port = services[(__bridge NSString *)kCFNetworkProxiesHTTPPort];
+    if (!host || host.length == 0 || !port) return nil;
+    return [NSString stringWithFormat:@"http://%@:%@", host, port];
+}
+
 - (NSString *)run:(NSArray<NSString *> *)arguments error:(NSError **)error {
     NSTask *task = [[NSTask alloc] init];
-    task.launchPath = self.nodePath;
+    task.launchPath = @"/bin/zsh";
 
-    NSMutableArray<NSString *> *taskArguments = [NSMutableArray arrayWithObject:self.binaryPath];
-    [taskArguments addObjectsFromArray:arguments];
-    task.arguments = taskArguments;
+    NSMutableArray<NSString *> *cmdParts = [NSMutableArray arrayWithObject:self.binaryPath];
+    [cmdParts addObjectsFromArray:arguments];
+    NSString *joinedCmd = [cmdParts componentsJoinedByString:@" "];
+    task.arguments = @[ @"-l", @"-c", joinedCmd ];
+
+    NSMutableDictionary *env = [[[NSProcessInfo processInfo] environment] mutableCopy];
+    NSString *proxyURL = [self systemProxyURL];
+    if (proxyURL.length > 0) {
+        if (!env[@"http_proxy"]) env[@"http_proxy"] = proxyURL;
+        if (!env[@"https_proxy"]) env[@"https_proxy"] = proxyURL;
+        if (!env[@"ALL_PROXY"]) env[@"ALL_PROXY"] = proxyURL;
+    }
+    task.environment = env;
 
     NSPipe *outputPipe = [NSPipe pipe];
     NSPipe *errorPipe = [NSPipe pipe];
@@ -204,7 +281,7 @@ static BOOL CAIsNotificationsNotAllowedError(NSError *error) {
         [task waitUntilExit];
     } @catch (NSException *exception) {
         if (error) {
-            *error = [NSError errorWithDomain:@"CodexAuthMenu"
+            *error = [NSError errorWithDomain:CAErrorDomain
                                          code:1
                                      userInfo:@{NSLocalizedDescriptionKey: exception.reason ?: @"Failed to launch codex-auth."}];
         }
@@ -217,7 +294,7 @@ static BOOL CAIsNotificationsNotAllowedError(NSError *error) {
     NSString *text = [[NSString alloc] initWithData:mergedData encoding:NSUTF8StringEncoding];
     if (!text) {
         if (error) {
-            *error = [NSError errorWithDomain:@"CodexAuthMenu"
+            *error = [NSError errorWithDomain:CAErrorDomain
                                          code:2
                                      userInfo:@{NSLocalizedDescriptionKey: @"codex-auth returned undecodable output."}];
         }
@@ -227,7 +304,7 @@ static BOOL CAIsNotificationsNotAllowedError(NSError *error) {
     if (task.terminationStatus != 0) {
         if (error) {
             NSString *message = [text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-            *error = [NSError errorWithDomain:@"CodexAuthMenu"
+            *error = [NSError errorWithDomain:CAErrorDomain
                                          code:task.terminationStatus
                                      userInfo:@{NSLocalizedDescriptionKey: message.length > 0 ? message : @"codex-auth failed."}];
         }
@@ -292,7 +369,7 @@ static BOOL CAIsNotificationsNotAllowedError(NSError *error) {
     }
 
     if (accounts.count == 0 && error) {
-        *error = [NSError errorWithDomain:@"CodexAuthMenu"
+        *error = [NSError errorWithDomain:CAErrorDomain
                                      code:4
                                  userInfo:@{NSLocalizedDescriptionKey: @"Could not parse any accounts from `codex-auth list`."}];
     }
@@ -327,7 +404,7 @@ static BOOL CAIsNotificationsNotAllowedError(NSError *error) {
     }
     if (!image) return nil;
 
-    image.size = NSMakeSize(18, 18);
+    image.size = NSMakeSize(CAMenuBarIconSize, CAMenuBarIconSize);
     image.template = NO;
     return image;
 }
@@ -495,12 +572,12 @@ static BOOL CAIsNotificationsNotAllowedError(NSError *error) {
 - (NSTimeInterval)loadPollInterval {
     NSArray<NSNumber *> *validIntervals = [self supportedPollIntervals];
     double savedInterval = [[NSUserDefaults standardUserDefaults] doubleForKey:CADefaultPollIntervalKey];
-    if (savedInterval <= 0) return 300;
+    if (savedInterval <= 0) return CADefaultPollInterval;
 
     for (NSNumber *value in validIntervals) {
         if (fabs(value.doubleValue - savedInterval) < DBL_EPSILON) return value.doubleValue;
     }
-    return 300;
+    return CADefaultPollInterval;
 }
 
 - (NSArray<NSNumber *> *)supportedPollIntervals {
@@ -576,22 +653,22 @@ static BOOL CAIsNotificationsNotAllowedError(NSError *error) {
 
 - (NSColor *)tagBackgroundColorForUsage:(NSInteger)usagePercent {
     if (usagePercent == NSNotFound || usagePercent <= 0) {
-        return [NSColor colorWithCalibratedRed:0.95 green:0.91 blue:0.91 alpha:1.0];
+        return [NSColor colorWithCalibratedRed:CATagBgRedLow green:CATagBgGreenLow blue:CATagBgBlueLow alpha:1.0];
     }
     if (usagePercent <= 10) {
-        return [NSColor colorWithCalibratedRed:0.95 green:0.93 blue:0.88 alpha:1.0];
+        return [NSColor colorWithCalibratedRed:CATagBgRedMedium green:CATagBgGreenMedium blue:CATagBgBlueMedium alpha:1.0];
     }
-    return [NSColor colorWithCalibratedRed:0.92 green:0.94 blue:0.93 alpha:1.0];
+    return [NSColor colorWithCalibratedRed:CATagBgRedHigh green:CATagBgGreenHigh blue:CATagBgBlueHigh alpha:1.0];
 }
 
 - (NSColor *)tagForegroundColorForUsage:(NSInteger)usagePercent {
     if (usagePercent == NSNotFound || usagePercent <= 0) {
-        return [NSColor colorWithCalibratedRed:0.56 green:0.25 blue:0.25 alpha:1.0];
+        return [NSColor colorWithCalibratedRed:CATagFgRedLow green:CATagFgGreenLow blue:CATagFgBlueLow alpha:1.0];
     }
     if (usagePercent <= 10) {
-        return [NSColor colorWithCalibratedRed:0.51 green:0.42 blue:0.18 alpha:1.0];
+        return [NSColor colorWithCalibratedRed:CATagFgRedMedium green:CATagFgGreenMedium blue:CATagFgBlueMedium alpha:1.0];
     }
-    return [NSColor colorWithCalibratedRed:0.28 green:0.40 blue:0.33 alpha:1.0];
+    return [NSColor colorWithCalibratedRed:CATagFgRedHigh green:CATagFgGreenHigh blue:CATagFgBlueHigh alpha:1.0];
 }
 
 - (NSAttributedString *)tagAttributedStringWithLabel:(NSString *)label
@@ -611,9 +688,9 @@ static BOOL CAIsNotificationsNotAllowedError(NSError *error) {
 - (NSAttributedString *)switchAccountTitleForAccount:(CAAccount *)account {
     NSMutableParagraphStyle *paragraphStyle = [[NSMutableParagraphStyle alloc] init];
     paragraphStyle.tabStops = @[
-        [[NSTextTab alloc] initWithTextAlignment:NSTextAlignmentRight location:320 options:@{}]
+        [[NSTextTab alloc] initWithTextAlignment:NSTextAlignmentRight location:CASwitchAccountTabLocation options:@{}]
     ];
-    paragraphStyle.defaultTabInterval = 320;
+    paragraphStyle.defaultTabInterval = CASwitchAccountTabLocation;
 
     NSDictionary *leftAttributes = @{
         NSParagraphStyleAttributeName: paragraphStyle,
@@ -655,9 +732,9 @@ static BOOL CAIsNotificationsNotAllowedError(NSError *error) {
 - (NSAttributedString *)alignedMenuTitleWithLeft:(NSString *)left right:(NSString *)right {
     NSMutableParagraphStyle *paragraphStyle = [[NSMutableParagraphStyle alloc] init];
     paragraphStyle.tabStops = @[
-        [[NSTextTab alloc] initWithTextAlignment:NSTextAlignmentRight location:230 options:@{}]
+        [[NSTextTab alloc] initWithTextAlignment:NSTextAlignmentRight location:CAAlignedMenuTabLocation options:@{}]
     ];
-    paragraphStyle.defaultTabInterval = 230;
+    paragraphStyle.defaultTabInterval = CAAlignedMenuTabLocation;
 
     NSDictionary *attributes = @{
         NSParagraphStyleAttributeName: paragraphStyle,
@@ -671,8 +748,8 @@ static BOOL CAIsNotificationsNotAllowedError(NSError *error) {
     NSString *text = [NSString stringWithFormat:@" %@ ", [self trimmedStringOrFallback:plan fallback:@"Unknown"]];
     NSDictionary *attributes = @{
         NSFontAttributeName: [NSFont systemFontOfSize:[NSFont smallSystemFontSize] weight:NSFontWeightMedium],
-        NSForegroundColorAttributeName: [NSColor colorWithCalibratedRed:0.24 green:0.30 blue:0.40 alpha:1.0],
-        NSBackgroundColorAttributeName: [NSColor colorWithCalibratedRed:0.90 green:0.92 blue:0.96 alpha:1.0]
+        NSForegroundColorAttributeName: [NSColor colorWithCalibratedRed:CAPlanTagFgRed green:CAPlanTagFgGreen blue:CAPlanTagFgBlue alpha:1.0],
+        NSBackgroundColorAttributeName: [NSColor colorWithCalibratedRed:CAPlanTagBgRed green:CAPlanTagBgGreen blue:CAPlanTagBgBlue alpha:1.0]
     };
     return [[NSAttributedString alloc] initWithString:text attributes:attributes];
 }
@@ -680,9 +757,9 @@ static BOOL CAIsNotificationsNotAllowedError(NSError *error) {
 - (NSAttributedString *)currentAccountHeaderForAccount:(CAAccount *)account {
     NSMutableParagraphStyle *paragraphStyle = [[NSMutableParagraphStyle alloc] init];
     paragraphStyle.tabStops = @[
-        [[NSTextTab alloc] initWithTextAlignment:NSTextAlignmentRight location:230 options:@{}]
+        [[NSTextTab alloc] initWithTextAlignment:NSTextAlignmentRight location:CAAlignedMenuTabLocation options:@{}]
     ];
-    paragraphStyle.defaultTabInterval = 230;
+    paragraphStyle.defaultTabInterval = CAAlignedMenuTabLocation;
 
     NSDictionary *leftAttributes = @{
         NSParagraphStyleAttributeName: paragraphStyle,
