@@ -102,27 +102,46 @@ static BOOL CAIsNotificationsNotAllowedError(NSError *error) {
 + (NSString *)resolvePathForCommand:(NSString *)command {
     NSTask *task = [[NSTask alloc] init];
     task.launchPath = @"/bin/zsh";
-    task.arguments = @[ @"-l", @"-c", [NSString stringWithFormat:@"which %@", command] ];
+    task.arguments = @[ @"-l", @"-c", [NSString stringWithFormat:@"command -v %@", command] ];
     NSPipe *pipe = [NSPipe pipe];
     task.standardOutput = pipe;
     task.standardError = [NSPipe pipe];
-    @try {
-        [task launch];
-        [task waitUntilExit];
-    } @catch (NSException *exception) {
-        return nil;
-    }
+    NSError *launchError = nil;
+    [task launchAndReturnError:&launchError];
+    if (launchError) return nil;
+    [task waitUntilExit];
     if (task.terminationStatus != 0) return nil;
     NSData *data = [[pipe fileHandleForReading] readDataToEndOfFile];
     NSString *path = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
-    return [path stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    path = [path stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (path.length == 0) return nil;
+    BOOL isDir = NO;
+    if (![[NSFileManager defaultManager] fileExistsAtPath:path isDirectory:&isDir] || isDir) return nil;
+    return path;
+}
+
+- (NSString *)nodePathForBinary:(NSString *)binaryPath {
+    NSString *nodeDir = [binaryPath stringByDeletingLastPathComponent];
+    NSString *candidateNode = [nodeDir stringByAppendingPathComponent:@"node"];
+    BOOL isDir = NO;
+    if ([[NSFileManager defaultManager] fileExistsAtPath:candidateNode isDirectory:&isDir] && !isDir) {
+        return candidateNode;
+    }
+    return nil;
 }
 
 - (instancetype)initWithBinaryPath:(NSString *)binaryPath nodePath:(NSString *)nodePath {
     self = [super init];
     if (self) {
         _binaryPath = binaryPath ?: [CodexAuthManager resolvePathForCommand:CACliName];
-        _nodePath = nodePath ?: [CodexAuthManager resolvePathForCommand:CANodeName];
+        if (nodePath) {
+            _nodePath = nodePath;
+        } else if (_binaryPath) {
+            NSString *siblingNode = [self nodePathForBinary:_binaryPath];
+            _nodePath = siblingNode ?: [CodexAuthManager resolvePathForCommand:CANodeName];
+        } else {
+            _nodePath = [CodexAuthManager resolvePathForCommand:CANodeName];
+        }
     }
     return self;
 }
@@ -200,12 +219,17 @@ static BOOL CAIsNotificationsNotAllowedError(NSError *error) {
     return [self run:@[@"config", @"auto", enabled ? @"enable" : @"disable"] error:error] != nil;
 }
 
+- (NSString *)shellEscapedPath:(NSString *)path {
+    return [NSString stringWithFormat:@"'%@'", [path stringByReplacingOccurrencesOfString:@"'" withString:@"'\\''"]];
+}
+
 - (BOOL)openInTerminal:(NSError **)error {
+    NSString *escapedBinary = [self shellEscapedPath:self.binaryPath];
     NSString *script = [NSString stringWithFormat:
                         @"tell application \"Terminal\"\n"
                         "activate\n"
                         "do script \"%@ status; %@ list\"\n"
-                        "end tell", self.binaryPath, self.binaryPath];
+                        "end tell", escapedBinary, escapedBinary];
     NSAppleScript *appleScript = [[NSAppleScript alloc] initWithSource:script];
     NSDictionary *scriptError = nil;
     [appleScript executeAndReturnError:&scriptError];
@@ -222,11 +246,13 @@ static BOOL CAIsNotificationsNotAllowedError(NSError *error) {
 }
 
 - (BOOL)startLoginInTerminal:(NSError **)error {
+    NSString *escapedNode = [self shellEscapedPath:self.nodePath];
+    NSString *escapedBinary = [self shellEscapedPath:self.binaryPath];
     NSString *script = [NSString stringWithFormat:
                         @"tell application \"Terminal\"\n"
                         "activate\n"
                         "do script \"%@ %@ login\"\n"
-                        "end tell", self.nodePath, self.binaryPath];
+                        "end tell", escapedNode, escapedBinary];
     NSAppleScript *appleScript = [[NSAppleScript alloc] initWithSource:script];
     NSDictionary *scriptError = nil;
     [appleScript executeAndReturnError:&scriptError];
