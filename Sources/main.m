@@ -1,15 +1,30 @@
 #import <Cocoa/Cocoa.h>
 #import <UserNotifications/UserNotifications.h>
+#import <Security/Security.h>
 #import <CoreFoundation/CFDictionary.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/stat.h>
 
 static NSString *const CAErrorDomain = @"CodexAuthMenu";
 static NSString *const CADefaultPollIntervalKey = @"pollIntervalSeconds";
 static NSString *const CAProxyModeKey = @"proxyMode";
 static NSString *const CAProxyModeDirectValue = @"direct";
 static NSString *const CAProxyModeSystemValue = @"system";
+static NSString *const CAActiveThirdPartyAccountIDKey = @"activeThirdPartyAccountID";
+static NSString *const CAOfficialConfigSnapshotKey = @"officialConfigSnapshot";
 static NSString *const CANotificationDedupKey = @"notificationDedupByAccount";
 static NSString *const CACliName = @"codex-auth";
 static NSString *const CANodeName = @"node";
+static NSString *const CAThirdPartyEndpointBaseURLValue = @"base_url";
+static NSString *const CAThirdPartyEndpointFullURLValue = @"full_url";
+static NSString *const CAThirdPartyAPIFormatResponsesValue = @"openai_responses";
+static NSString *const CAThirdPartyAPIFormatChatValue = @"openai_chat";
+static NSString *const CAKeychainService = @"CodexAuthMenu.ThirdPartyAPIKey";
+static NSString *const CAAppSupportFolderName = @"CodexAuthMenu";
+static NSString *const CAThirdPartyAccountsFileName = @"third-party-accounts.json";
+static NSString *const CAOfficialAuthBackupFileName = @"official-auth.json.backup";
+static NSString *const CACodexProviderIDPrefix = @"codex_auth_menu_";
 static const NSTimeInterval CADefaultPollInterval = 300.0;
 static const CGFloat CAMenuBarIconSize = 18.0;
 static const CGFloat CASwitchAccountTabLocation = 320.0;
@@ -47,6 +62,13 @@ static const CGFloat CAErrorTagFgRed = 0.65;
 static const CGFloat CAErrorTagFgGreen = 0.15;
 static const CGFloat CAErrorTagFgBlue = 0.15;
 
+static const CGFloat CAThirdPartyTagFgRed = 0.10;
+static const CGFloat CAThirdPartyTagFgGreen = 0.38;
+static const CGFloat CAThirdPartyTagFgBlue = 0.18;
+static const CGFloat CAThirdPartyTagBgRed = 0.86;
+static const CGFloat CAThirdPartyTagBgGreen = 0.95;
+static const CGFloat CAThirdPartyTagBgBlue = 0.88;
+
 typedef NS_ENUM(NSInteger, CAAccountHealth) {
     CAAccountHealthOK = 0,
     CAAccountHealthAuthFailed = 1,
@@ -71,6 +93,30 @@ static BOOL CAIsNotificationsNotAllowedError(NSError *error) {
     return error != nil &&
            [error.domain isEqualToString:UNErrorDomain] &&
            error.code == UNErrorCodeNotificationsNotAllowed;
+}
+
+static NSString *CATrimString(NSString *value) {
+    if (![value isKindOfClass:[NSString class]]) return @"";
+    return [value stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+}
+
+static NSString *CAJSONStringValue(id value) {
+    return [value isKindOfClass:[NSString class]] ? value : @"";
+}
+
+static NSString *CATOMLEscapedString(NSString *value) {
+    NSString *escaped = [value stringByReplacingOccurrencesOfString:@"\\" withString:@"\\\\"];
+    escaped = [escaped stringByReplacingOccurrencesOfString:@"\"" withString:@"\\\""];
+    escaped = [escaped stringByReplacingOccurrencesOfString:@"\n" withString:@" "];
+    escaped = [escaped stringByReplacingOccurrencesOfString:@"\r" withString:@" "];
+    return escaped ?: @"";
+}
+
+static BOOL CAStringHasAnyPrefix(NSString *value, NSArray<NSString *> *prefixes) {
+    for (NSString *prefix in prefixes) {
+        if ([value hasPrefix:prefix]) return YES;
+    }
+    return NO;
 }
 
 @interface CAAccount : NSObject
@@ -108,6 +154,713 @@ static BOOL CAIsNotificationsNotAllowedError(NSError *error) {
     }
     return self;
 }
+@end
+
+@interface CAThirdPartyAccount : NSObject
+@property(nonatomic, copy) NSString *identifier;
+@property(nonatomic, copy) NSString *remark;
+@property(nonatomic, copy) NSString *providerName;
+@property(nonatomic, copy) NSString *websiteURL;
+@property(nonatomic, copy) NSString *endpointURL;
+@property(nonatomic, copy) NSString *endpointType;
+@property(nonatomic, copy) NSString *modelName;
+@property(nonatomic, copy) NSString *apiFormat;
+@property(nonatomic, copy) NSString *keychainIdentifier;
+@property(nonatomic, copy) NSString *codexProviderID;
++ (instancetype)accountFromDictionary:(NSDictionary *)dictionary;
+- (NSDictionary *)dictionaryRepresentation;
+- (BOOL)isChatCompletionsOnly;
+@end
+
+@interface CAEditableTextField : NSTextField <NSTextFieldDelegate>
+@property(nonatomic, weak) NSTextField *characterCountLabel;
+- (void)updateCharacterCount;
+@end
+
+@implementation CAEditableTextField
+
+- (instancetype)initWithFrame:(NSRect)frameRect {
+    self = [super initWithFrame:frameRect];
+    if (self) {
+        self.delegate = self;
+        self.usesSingleLineMode = YES;
+        self.cell.scrollable = YES;
+        self.cell.lineBreakMode = NSLineBreakByClipping;
+    }
+    return self;
+}
+
+- (void)setCharacterCountLabel:(NSTextField *)characterCountLabel {
+    _characterCountLabel = characterCountLabel;
+    [self updateCharacterCount];
+}
+
+- (void)updateCharacterCount {
+    if (!self.characterCountLabel) return;
+    self.characterCountLabel.stringValue =
+        [NSString stringWithFormat:@"%lu characters, no length limit", (unsigned long)self.stringValue.length];
+}
+
+- (void)controlTextDidChange:(NSNotification *)notification {
+    [self updateCharacterCount];
+}
+
+- (BOOL)performKeyEquivalent:(NSEvent *)event {
+    if ((event.modifierFlags & NSEventModifierFlagDeviceIndependentFlagsMask) != NSEventModifierFlagCommand) {
+        return [super performKeyEquivalent:event];
+    }
+
+    NSString *characters = [event.charactersIgnoringModifiers lowercaseString];
+    SEL action = NULL;
+    if ([characters isEqualToString:@"x"]) action = @selector(cut:);
+    else if ([characters isEqualToString:@"c"]) action = @selector(copy:);
+    else if ([characters isEqualToString:@"v"]) action = @selector(paste:);
+    else if ([characters isEqualToString:@"a"]) action = @selector(selectAll:);
+    if (!action) return [super performKeyEquivalent:event];
+
+    id editor = [self currentEditor];
+    if (editor && [editor respondsToSelector:action]) {
+        [NSApp sendAction:action to:editor from:self];
+        [self updateCharacterCount];
+        return YES;
+    }
+    return [super performKeyEquivalent:event];
+}
+
+@end
+
+@interface CASecureEditableTextField : NSSecureTextField <NSTextFieldDelegate>
+@property(nonatomic, weak) NSTextField *characterCountLabel;
+- (void)updateCharacterCount;
+@end
+
+@implementation CASecureEditableTextField
+
+- (instancetype)initWithFrame:(NSRect)frameRect {
+    self = [super initWithFrame:frameRect];
+    if (self) {
+        self.delegate = self;
+        self.usesSingleLineMode = YES;
+        self.cell.scrollable = YES;
+        self.cell.lineBreakMode = NSLineBreakByClipping;
+    }
+    return self;
+}
+
+- (void)setCharacterCountLabel:(NSTextField *)characterCountLabel {
+    _characterCountLabel = characterCountLabel;
+    [self updateCharacterCount];
+}
+
+- (void)updateCharacterCount {
+    if (!self.characterCountLabel) return;
+    self.characterCountLabel.stringValue =
+        [NSString stringWithFormat:@"%lu characters, no length limit", (unsigned long)self.stringValue.length];
+}
+
+- (void)controlTextDidChange:(NSNotification *)notification {
+    [self updateCharacterCount];
+}
+
+- (BOOL)performKeyEquivalent:(NSEvent *)event {
+    if ((event.modifierFlags & NSEventModifierFlagDeviceIndependentFlagsMask) != NSEventModifierFlagCommand) {
+        return [super performKeyEquivalent:event];
+    }
+
+    NSString *characters = [event.charactersIgnoringModifiers lowercaseString];
+    SEL action = NULL;
+    if ([characters isEqualToString:@"x"]) action = @selector(cut:);
+    else if ([characters isEqualToString:@"c"]) action = @selector(copy:);
+    else if ([characters isEqualToString:@"v"]) action = @selector(paste:);
+    else if ([characters isEqualToString:@"a"]) action = @selector(selectAll:);
+    if (!action) return [super performKeyEquivalent:event];
+
+    id editor = [self currentEditor];
+    if (editor && [editor respondsToSelector:action]) {
+        [NSApp sendAction:action to:editor from:self];
+        [self updateCharacterCount];
+        return YES;
+    }
+    return [super performKeyEquivalent:event];
+}
+
+@end
+
+@implementation CAThirdPartyAccount
+
++ (instancetype)accountFromDictionary:(NSDictionary *)dictionary {
+    if (![dictionary isKindOfClass:[NSDictionary class]]) return nil;
+    CAThirdPartyAccount *account = [[CAThirdPartyAccount alloc] init];
+    account.identifier = CATrimString(CAJSONStringValue(dictionary[@"id"]));
+    account.remark = CATrimString(CAJSONStringValue(dictionary[@"remark"]));
+    account.providerName = CATrimString(CAJSONStringValue(dictionary[@"providerName"]));
+    account.websiteURL = CATrimString(CAJSONStringValue(dictionary[@"websiteURL"]));
+    account.endpointURL = CATrimString(CAJSONStringValue(dictionary[@"endpointURL"]));
+    account.endpointType = CATrimString(CAJSONStringValue(dictionary[@"endpointType"]));
+    account.modelName = CATrimString(CAJSONStringValue(dictionary[@"modelName"]));
+    account.apiFormat = CATrimString(CAJSONStringValue(dictionary[@"apiFormat"]));
+    account.keychainIdentifier = CATrimString(CAJSONStringValue(dictionary[@"keychainIdentifier"]));
+    account.codexProviderID = CATrimString(CAJSONStringValue(dictionary[@"codexProviderID"]));
+    if (account.identifier.length == 0 ||
+        account.remark.length == 0 ||
+        account.providerName.length == 0 ||
+        account.endpointURL.length == 0 ||
+        account.endpointType.length == 0 ||
+        account.modelName.length == 0 ||
+        account.keychainIdentifier.length == 0 ||
+        account.codexProviderID.length == 0) {
+        return nil;
+    }
+    if (account.apiFormat.length == 0) account.apiFormat = CAThirdPartyAPIFormatResponsesValue;
+    return account;
+}
+
+- (NSDictionary *)dictionaryRepresentation {
+    return @{
+        @"id": self.identifier ?: @"",
+        @"remark": self.remark ?: @"",
+        @"providerName": self.providerName ?: @"",
+        @"websiteURL": self.websiteURL ?: @"",
+        @"endpointURL": self.endpointURL ?: @"",
+        @"endpointType": self.endpointType ?: CAThirdPartyEndpointBaseURLValue,
+        @"modelName": self.modelName ?: @"",
+        @"apiFormat": self.apiFormat ?: CAThirdPartyAPIFormatResponsesValue,
+        @"keychainIdentifier": self.keychainIdentifier ?: @"",
+        @"codexProviderID": self.codexProviderID ?: @""
+    };
+}
+
+- (BOOL)isChatCompletionsOnly {
+    return [self.apiFormat isEqualToString:CAThirdPartyAPIFormatChatValue];
+}
+
+@end
+
+@interface CAThirdPartyAccountStore : NSObject
++ (NSString *)applicationSupportDirectory;
++ (NSString *)accountsPath;
++ (NSArray<CAThirdPartyAccount *> *)loadAccounts:(NSError **)error;
++ (BOOL)saveAccounts:(NSArray<CAThirdPartyAccount *> *)accounts error:(NSError **)error;
++ (NSString *)apiKeyForAccount:(CAThirdPartyAccount *)account error:(NSError **)error;
++ (BOOL)saveAPIKey:(NSString *)apiKey forAccount:(CAThirdPartyAccount *)account error:(NSError **)error;
++ (BOOL)deleteAPIKeyForAccount:(CAThirdPartyAccount *)account error:(NSError **)error;
+@end
+
+@implementation CAThirdPartyAccountStore
+
++ (NSString *)applicationSupportDirectory {
+    NSArray<NSURL *> *urls = [[NSFileManager defaultManager] URLsForDirectory:NSApplicationSupportDirectory
+                                                                    inDomains:NSUserDomainMask];
+    NSURL *baseURL = urls.firstObject;
+    if (!baseURL) {
+        baseURL = [NSURL fileURLWithPath:[NSHomeDirectory() stringByAppendingPathComponent:@"Library/Application Support"]];
+    }
+    return [[baseURL path] stringByAppendingPathComponent:CAAppSupportFolderName];
+}
+
++ (NSString *)accountsPath {
+    return [[self applicationSupportDirectory] stringByAppendingPathComponent:CAThirdPartyAccountsFileName];
+}
+
++ (NSArray<CAThirdPartyAccount *> *)loadAccounts:(NSError **)error {
+    NSString *path = [self accountsPath];
+    if (![[NSFileManager defaultManager] fileExistsAtPath:path]) return @[];
+
+    NSData *data = [NSData dataWithContentsOfFile:path options:0 error:error];
+    if (!data) return nil;
+
+    id json = [NSJSONSerialization JSONObjectWithData:data options:0 error:error];
+    if (![json isKindOfClass:[NSArray class]]) {
+        if (error) {
+            *error = [NSError errorWithDomain:CAErrorDomain
+                                         code:30
+                                     userInfo:@{NSLocalizedDescriptionKey: @"Third Party accounts file is not a JSON array."}];
+        }
+        return nil;
+    }
+
+    NSMutableArray<CAThirdPartyAccount *> *accounts = [NSMutableArray array];
+    for (id item in (NSArray *)json) {
+        CAThirdPartyAccount *account = [CAThirdPartyAccount accountFromDictionary:item];
+        if (account) [accounts addObject:account];
+    }
+    return accounts;
+}
+
++ (BOOL)saveAccounts:(NSArray<CAThirdPartyAccount *> *)accounts error:(NSError **)error {
+    NSString *directory = [self applicationSupportDirectory];
+    if (![[NSFileManager defaultManager] createDirectoryAtPath:directory
+                                   withIntermediateDirectories:YES
+                                                    attributes:nil
+                                                         error:error]) {
+        return NO;
+    }
+
+    NSMutableArray *json = [NSMutableArray array];
+    for (CAThirdPartyAccount *account in accounts) {
+        [json addObject:[account dictionaryRepresentation]];
+    }
+    NSData *data = [NSJSONSerialization dataWithJSONObject:json options:NSJSONWritingPrettyPrinted error:error];
+    if (!data) return NO;
+    return [data writeToFile:[self accountsPath] options:NSDataWritingAtomic error:error];
+}
+
++ (NSDictionary *)keychainQueryForIdentifier:(NSString *)identifier {
+    return @{
+        (__bridge id)kSecClass: (__bridge id)kSecClassGenericPassword,
+        (__bridge id)kSecAttrService: CAKeychainService,
+        (__bridge id)kSecAttrAccount: identifier ?: @""
+    };
+}
+
++ (NSString *)apiKeyForAccount:(CAThirdPartyAccount *)account error:(NSError **)error {
+    NSMutableDictionary *query = [[self keychainQueryForIdentifier:account.keychainIdentifier] mutableCopy];
+    query[(__bridge id)kSecReturnData] = @YES;
+    query[(__bridge id)kSecMatchLimit] = (__bridge id)kSecMatchLimitOne;
+
+    CFTypeRef result = NULL;
+    OSStatus status = SecItemCopyMatching((__bridge CFDictionaryRef)query, &result);
+    if (status == errSecItemNotFound) return @"";
+    if (status != errSecSuccess) {
+        if (error) {
+            *error = [NSError errorWithDomain:CAErrorDomain
+                                         code:31
+                                     userInfo:@{NSLocalizedDescriptionKey:
+                                                    [NSString stringWithFormat:@"Failed to read API Key from Keychain (%d).", (int)status]}];
+        }
+        return nil;
+    }
+
+    NSData *data = (__bridge_transfer NSData *)result;
+    NSString *apiKey = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+    return apiKey ?: @"";
+}
+
++ (BOOL)saveAPIKey:(NSString *)apiKey forAccount:(CAThirdPartyAccount *)account error:(NSError **)error {
+    NSData *data = [apiKey dataUsingEncoding:NSUTF8StringEncoding] ?: [NSData data];
+    NSDictionary *query = [self keychainQueryForIdentifier:account.keychainIdentifier];
+    NSDictionary *attributes = @{(__bridge id)kSecValueData: data};
+
+    OSStatus updateStatus = SecItemUpdate((__bridge CFDictionaryRef)query, (__bridge CFDictionaryRef)attributes);
+    if (updateStatus != errSecSuccess && updateStatus != errSecItemNotFound) {
+        if (error) {
+            *error = [NSError errorWithDomain:CAErrorDomain
+                                         code:32
+                                     userInfo:@{NSLocalizedDescriptionKey:
+                                                    [NSString stringWithFormat:@"Failed to update API Key in Keychain (%d).", (int)updateStatus]}];
+        }
+        return NO;
+    }
+
+    if (updateStatus == errSecItemNotFound) {
+        NSMutableDictionary *addQuery = [query mutableCopy];
+        addQuery[(__bridge id)kSecValueData] = data;
+        OSStatus addStatus = SecItemAdd((__bridge CFDictionaryRef)addQuery, NULL);
+        if (addStatus != errSecSuccess) {
+            if (error) {
+                *error = [NSError errorWithDomain:CAErrorDomain
+                                             code:33
+                                         userInfo:@{NSLocalizedDescriptionKey:
+                                                        [NSString stringWithFormat:@"Failed to save API Key to Keychain (%d).", (int)addStatus]}];
+            }
+            return NO;
+        }
+    }
+
+    NSError *readError = nil;
+    NSString *savedAPIKey = [self apiKeyForAccount:account error:&readError];
+    if (!savedAPIKey || ![savedAPIKey isEqualToString:apiKey]) {
+        if (error) {
+            *error = readError ?: [NSError errorWithDomain:CAErrorDomain
+                                                       code:34
+                                                   userInfo:@{NSLocalizedDescriptionKey:
+                                                                  @"API Key verification failed after saving. The saved value did not match the complete input."}];
+        }
+        return NO;
+    }
+    return YES;
+}
+
++ (BOOL)deleteAPIKeyForAccount:(CAThirdPartyAccount *)account error:(NSError **)error {
+    OSStatus status = SecItemDelete((__bridge CFDictionaryRef)[self keychainQueryForIdentifier:account.keychainIdentifier]);
+    if (status == errSecSuccess || status == errSecItemNotFound) return YES;
+    if (error) {
+        *error = [NSError errorWithDomain:CAErrorDomain
+                                     code:34
+                                 userInfo:@{NSLocalizedDescriptionKey:
+                                                [NSString stringWithFormat:@"Failed to delete API Key from Keychain (%d).", (int)status]}];
+    }
+    return NO;
+}
+
+@end
+
+@interface CACodexConfigManager : NSObject
++ (NSString *)codexConfigPath;
++ (NSString *)codexAuthPath;
++ (NSString *)readConfigText:(NSError **)error;
++ (BOOL)writeConfigText:(NSString *)text error:(NSError **)error;
++ (BOOL)backupOfficialAuthReplacingExisting:(BOOL)replaceExisting error:(NSError **)error;
++ (BOOL)writeThirdPartyConfigText:(NSString *)configText apiKey:(NSString *)apiKey error:(NSError **)error;
++ (BOOL)restoreOfficialAuthIfNeeded:(NSError **)error;
++ (NSDictionary *)snapshotFromConfigText:(NSString *)text;
++ (NSString *)configTextByApplyingThirdPartyAccount:(CAThirdPartyAccount *)account
+                                            apiKey:(NSString *)apiKey
+                                            toText:(NSString *)text
+                                             error:(NSError **)error;
++ (NSString *)configTextByRestoringSnapshot:(NSDictionary *)snapshot
+                        removingProviderIDs:(NSArray<NSString *> *)providerIDs
+                                   fromText:(NSString *)text;
+@end
+
+@implementation CACodexConfigManager
+
++ (NSString *)codexConfigPath {
+    return [[NSHomeDirectory() stringByAppendingPathComponent:@".codex"] stringByAppendingPathComponent:@"config.toml"];
+}
+
++ (NSString *)codexAuthPath {
+    return [[NSHomeDirectory() stringByAppendingPathComponent:@".codex"] stringByAppendingPathComponent:@"auth.json"];
+}
+
++ (NSString *)officialAuthBackupPath {
+    return [[CAThirdPartyAccountStore applicationSupportDirectory] stringByAppendingPathComponent:CAOfficialAuthBackupFileName];
+}
+
++ (BOOL)ensurePrivateDirectory:(NSString *)directory error:(NSError **)error {
+    if (![[NSFileManager defaultManager] createDirectoryAtPath:directory
+                                   withIntermediateDirectories:YES
+                                                    attributes:@{NSFilePosixPermissions: @0700}
+                                                         error:error]) {
+        return NO;
+    }
+    chmod(directory.fileSystemRepresentation, 0700);
+    return YES;
+}
+
++ (BOOL)writePrivateData:(NSData *)data toPath:(NSString *)path error:(NSError **)error {
+    if (![self ensurePrivateDirectory:[path stringByDeletingLastPathComponent] error:error]) return NO;
+    if (![data writeToFile:path options:NSDataWritingAtomic error:error]) return NO;
+    chmod(path.fileSystemRepresentation, 0600);
+    return YES;
+}
+
++ (BOOL)backupOfficialAuthReplacingExisting:(BOOL)replaceExisting error:(NSError **)error {
+    NSString *backupPath = [self officialAuthBackupPath];
+    if (replaceExisting && [[NSFileManager defaultManager] fileExistsAtPath:backupPath]) {
+        if (![[NSFileManager defaultManager] removeItemAtPath:backupPath error:error]) return NO;
+    }
+    if ([[NSFileManager defaultManager] fileExistsAtPath:backupPath]) return YES;
+
+    NSString *authPath = [self codexAuthPath];
+    if (![[NSFileManager defaultManager] fileExistsAtPath:authPath]) {
+        return [self writePrivateData:[NSData data] toPath:backupPath error:error];
+    }
+    NSData *data = [NSData dataWithContentsOfFile:authPath options:0 error:error];
+    if (!data) return NO;
+    return [self writePrivateData:data toPath:backupPath error:error];
+}
+
++ (NSData *)thirdPartyAuthDataWithAPIKey:(NSString *)apiKey error:(NSError **)error {
+    if (apiKey.length == 0) {
+        if (error) {
+            *error = [NSError errorWithDomain:CAErrorDomain
+                                         code:44
+                                     userInfo:@{NSLocalizedDescriptionKey: @"API Key is required."}];
+        }
+        return nil;
+    }
+    return [NSJSONSerialization dataWithJSONObject:@{@"OPENAI_API_KEY": apiKey}
+                                           options:NSJSONWritingPrettyPrinted
+                                             error:error];
+}
+
++ (BOOL)restoreFileAtPath:(NSString *)path
+                existed:(BOOL)existed
+                   data:(NSData *)data
+                  error:(NSError **)error {
+    if (existed) {
+        return [self writePrivateData:data ?: [NSData data] toPath:path error:error];
+    }
+    if (![[NSFileManager defaultManager] fileExistsAtPath:path]) return YES;
+    return [[NSFileManager defaultManager] removeItemAtPath:path error:error];
+}
+
++ (BOOL)writeThirdPartyConfigText:(NSString *)configText apiKey:(NSString *)apiKey error:(NSError **)error {
+    NSString *authPath = [self codexAuthPath];
+    BOOL authExisted = [[NSFileManager defaultManager] fileExistsAtPath:authPath];
+    NSData *originalAuthData = authExisted ? [NSData dataWithContentsOfFile:authPath options:0 error:error] : nil;
+    if (authExisted && !originalAuthData) return NO;
+
+    NSData *thirdPartyAuthData = [self thirdPartyAuthDataWithAPIKey:apiKey error:error];
+    if (!thirdPartyAuthData) return NO;
+    if (![self writePrivateData:thirdPartyAuthData toPath:authPath error:error]) return NO;
+
+    NSError *configError = nil;
+    if ([self writeConfigText:configText error:&configError]) return YES;
+
+    NSError *rollbackError = nil;
+    BOOL rolledBack = [self restoreFileAtPath:authPath
+                                      existed:authExisted
+                                         data:originalAuthData
+                                        error:&rollbackError];
+    if (error) {
+        NSString *message = configError.localizedDescription ?: @"Failed to write Codex config.";
+        if (!rolledBack) {
+            message = [message stringByAppendingFormat:@" API Key auth rollback also failed: %@",
+                                                    rollbackError.localizedDescription ?: @"unknown error"];
+        }
+        *error = [NSError errorWithDomain:CAErrorDomain
+                                     code:45
+                                 userInfo:@{NSLocalizedDescriptionKey: message}];
+    }
+    return NO;
+}
+
++ (BOOL)restoreOfficialAuthIfNeeded:(NSError **)error {
+    NSString *backupPath = [self officialAuthBackupPath];
+    if (![[NSFileManager defaultManager] fileExistsAtPath:backupPath]) return YES;
+
+    NSData *data = [NSData dataWithContentsOfFile:backupPath options:0 error:error];
+    if (!data) return NO;
+    NSString *authPath = [self codexAuthPath];
+    BOOL success = YES;
+    if (data.length == 0) {
+        if ([[NSFileManager defaultManager] fileExistsAtPath:authPath]) {
+            success = [[NSFileManager defaultManager] removeItemAtPath:authPath error:error];
+        }
+    } else {
+        success = [self writePrivateData:data toPath:authPath error:error];
+    }
+    if (!success) return NO;
+    [[NSFileManager defaultManager] removeItemAtPath:backupPath error:nil];
+    return YES;
+}
+
++ (NSString *)readConfigText:(NSError **)error {
+    NSString *path = [self codexConfigPath];
+    if (![[NSFileManager defaultManager] fileExistsAtPath:path]) return @"";
+    NSString *text = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:error];
+    return text ?: nil;
+}
+
++ (BOOL)writeConfigText:(NSString *)text error:(NSError **)error {
+    NSString *path = [self codexConfigPath];
+    NSString *directory = [path stringByDeletingLastPathComponent];
+    if (![[NSFileManager defaultManager] createDirectoryAtPath:directory
+                                   withIntermediateDirectories:YES
+                                                    attributes:nil
+                                                         error:error]) {
+        return NO;
+    }
+    return [text writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:error];
+}
+
++ (BOOL)line:(NSString *)trimmed startsWithTopLevelKey:(NSString *)key {
+    if (![trimmed hasPrefix:key]) return NO;
+    if (trimmed.length == key.length) return NO;
+    unichar ch = [trimmed characterAtIndex:key.length];
+    return ch == '=' || [[NSCharacterSet whitespaceCharacterSet] characterIsMember:ch];
+}
+
++ (NSString *)topLevelRawValueForKey:(NSString *)key inText:(NSString *)text {
+    NSArray<NSString *> *lines = [text componentsSeparatedByCharactersInSet:[NSCharacterSet newlineCharacterSet]];
+    for (NSString *line in lines) {
+        NSString *trimmed = CATrimString(line);
+        if ([trimmed hasPrefix:@"["]) break;
+        if (![self line:trimmed startsWithTopLevelKey:key]) continue;
+        NSRange eq = [trimmed rangeOfString:@"="];
+        if (eq.location == NSNotFound) continue;
+        return CATrimString([trimmed substringFromIndex:eq.location + 1]);
+    }
+    return nil;
+}
+
++ (NSDictionary *)snapshotFromConfigText:(NSString *)text {
+    NSArray<NSString *> *keys = @[@"model_provider", @"model", @"model_reasoning_effort", @"disable_response_storage"];
+    NSMutableDictionary *topLevel = [NSMutableDictionary dictionary];
+    for (NSString *key in keys) {
+        NSString *rawValue = [self topLevelRawValueForKey:key inText:text];
+        topLevel[key] = @{
+            @"present": @(rawValue != nil),
+            @"rawValue": rawValue ?: @""
+        };
+    }
+    return @{
+        @"topLevel": topLevel,
+        @"createdAt": @([[NSDate date] timeIntervalSince1970])
+    };
+}
+
++ (NSString *)textByRemovingTopLevelKeys:(NSArray<NSString *> *)keys fromText:(NSString *)text {
+    NSArray<NSString *> *lines = [text componentsSeparatedByCharactersInSet:[NSCharacterSet newlineCharacterSet]];
+    NSMutableArray<NSString *> *kept = [NSMutableArray array];
+    BOOL inSection = NO;
+    for (NSString *line in lines) {
+        NSString *trimmed = CATrimString(line);
+        if ([trimmed hasPrefix:@"["]) inSection = YES;
+        BOOL remove = NO;
+        if (!inSection) {
+            for (NSString *key in keys) {
+                if ([self line:trimmed startsWithTopLevelKey:key]) {
+                    remove = YES;
+                    break;
+                }
+            }
+        }
+        if (!remove) [kept addObject:line];
+    }
+    return [kept componentsJoinedByString:@"\n"];
+}
+
++ (NSString *)textByRemovingProviderSections:(NSArray<NSString *> *)providerIDs fromText:(NSString *)text {
+    if (text.length == 0) return text ?: @"";
+    NSMutableSet<NSString *> *headers = [NSMutableSet set];
+    for (NSString *providerID in providerIDs) {
+        if (providerID.length > 0) {
+            [headers addObject:[NSString stringWithFormat:@"[model_providers.%@]", providerID]];
+        }
+    }
+
+    NSArray<NSString *> *lines = [text componentsSeparatedByCharactersInSet:[NSCharacterSet newlineCharacterSet]];
+    NSMutableArray<NSString *> *kept = [NSMutableArray array];
+    BOOL skipping = NO;
+    for (NSString *line in lines) {
+        NSString *trimmed = CATrimString(line);
+        if ([trimmed hasPrefix:@"["]) {
+            BOOL isManagedProviderSection =
+                [trimmed hasPrefix:[NSString stringWithFormat:@"[model_providers.%@", CACodexProviderIDPrefix]] &&
+                [trimmed hasSuffix:@"]"];
+            skipping = [headers containsObject:trimmed] || isManagedProviderSection;
+            if (skipping) continue;
+        }
+        if (!skipping) [kept addObject:line];
+    }
+    return [kept componentsJoinedByString:@"\n"];
+}
+
++ (NSString *)normalizedBaseURLForAccount:(CAThirdPartyAccount *)account error:(NSError **)error {
+    NSString *endpoint = [account.endpointURL stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    while ([endpoint hasSuffix:@"/"]) {
+        endpoint = [endpoint substringToIndex:endpoint.length - 1];
+    }
+    if (endpoint.length == 0) {
+        if (error) {
+            *error = [NSError errorWithDomain:CAErrorDomain
+                                         code:40
+                                     userInfo:@{NSLocalizedDescriptionKey: @"API Request URL is required."}];
+        }
+        return nil;
+    }
+
+    if (![account.endpointType isEqualToString:CAThirdPartyEndpointFullURLValue]) {
+        return endpoint;
+    }
+
+    NSString *withoutQuery = [[endpoint componentsSeparatedByString:@"?"] firstObject];
+    NSString *lower = [withoutQuery lowercaseString];
+    if ([lower hasSuffix:@"/v1/responses"]) {
+        return [withoutQuery substringToIndex:withoutQuery.length - @"/responses".length];
+    }
+    if ([lower hasSuffix:@"/responses"]) {
+        return [withoutQuery substringToIndex:withoutQuery.length - @"/responses".length];
+    }
+
+    if (error) {
+        *error = [NSError errorWithDomain:CAErrorDomain
+                                     code:41
+                                 userInfo:@{NSLocalizedDescriptionKey:
+                                                @"Full URL must end with /responses or /v1/responses for direct Codex use."}];
+    }
+    return nil;
+}
+
++ (NSString *)configTextByApplyingThirdPartyAccount:(CAThirdPartyAccount *)account
+                                            apiKey:(NSString *)apiKey
+                                            toText:(NSString *)text
+                                             error:(NSError **)error {
+    if ([account isChatCompletionsOnly]) {
+        if (error) {
+            *error = [NSError errorWithDomain:CAErrorDomain
+                                         code:42
+                                     userInfo:@{NSLocalizedDescriptionKey:
+                                                    @"This provider uses Chat Completions. Local routing is required and is not supported yet."}];
+        }
+        return nil;
+    }
+
+    NSString *baseURL = [self normalizedBaseURLForAccount:account error:error];
+    if (!baseURL) return nil;
+    if (apiKey.length == 0) {
+        if (error) {
+            *error = [NSError errorWithDomain:CAErrorDomain
+                                         code:43
+                                     userInfo:@{NSLocalizedDescriptionKey: @"API Key is required."}];
+        }
+        return nil;
+    }
+
+    NSArray<NSString *> *topKeys = @[@"model_provider", @"model", @"model_reasoning_effort", @"disable_response_storage"];
+    NSString *cleaned = [self textByRemovingTopLevelKeys:topKeys fromText:text ?: @""];
+    cleaned = [self textByRemovingProviderSections:@[account.codexProviderID] fromText:cleaned];
+    NSString *trimmedCleaned = [cleaned stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+
+    NSString *topBlock = [NSString stringWithFormat:
+                          @"model_provider = \"%@\"\n"
+                          "model = \"%@\"\n"
+                          "model_reasoning_effort = \"high\"\n"
+                          "disable_response_storage = true",
+                          CATOMLEscapedString(account.codexProviderID),
+                          CATOMLEscapedString(account.modelName)];
+    NSString *providerBlock = [NSString stringWithFormat:
+                               @"[model_providers.%@]\n"
+                               "name = \"%@\"\n"
+                               "base_url = \"%@\"\n"
+                               "wire_api = \"responses\"\n"
+                               "requires_openai_auth = true",
+                               account.codexProviderID,
+                               CATOMLEscapedString(account.providerName),
+                               CATOMLEscapedString(baseURL)];
+
+    NSMutableString *result = [NSMutableString stringWithString:topBlock];
+    if (trimmedCleaned.length > 0) {
+        [result appendFormat:@"\n\n%@", trimmedCleaned];
+    }
+    [result appendFormat:@"\n\n%@\n", providerBlock];
+    return result;
+}
+
++ (NSString *)configTextByRestoringSnapshot:(NSDictionary *)snapshot
+                        removingProviderIDs:(NSArray<NSString *> *)providerIDs
+                                   fromText:(NSString *)text {
+    NSArray<NSString *> *topKeys = @[@"model_provider", @"model", @"model_reasoning_effort", @"disable_response_storage"];
+    NSString *cleaned = [self textByRemovingTopLevelKeys:topKeys fromText:text ?: @""];
+    cleaned = [self textByRemovingProviderSections:providerIDs fromText:cleaned];
+    NSString *trimmedCleaned = [cleaned stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+
+    NSDictionary *topLevel = [snapshot[@"topLevel"] isKindOfClass:[NSDictionary class]] ? snapshot[@"topLevel"] : @{};
+    NSMutableArray<NSString *> *restoredLines = [NSMutableArray array];
+    for (NSString *key in topKeys) {
+        NSDictionary *entry = [topLevel[key] isKindOfClass:[NSDictionary class]] ? topLevel[key] : nil;
+        if (![entry[@"present"] boolValue]) continue;
+        NSString *rawValue = CAJSONStringValue(entry[@"rawValue"]);
+        if (rawValue.length > 0) {
+            [restoredLines addObject:[NSString stringWithFormat:@"%@ = %@", key, rawValue]];
+        }
+    }
+
+    NSMutableString *result = [NSMutableString string];
+    if (restoredLines.count > 0) {
+        [result appendString:[restoredLines componentsJoinedByString:@"\n"]];
+    }
+    if (trimmedCleaned.length > 0) {
+        if (result.length > 0) [result appendString:@"\n\n"];
+        [result appendString:trimmedCleaned];
+    }
+    if (result.length > 0 && ![result hasSuffix:@"\n"]) [result appendString:@"\n"];
+    return result;
+}
+
 @end
 
 @interface CodexAuthManager : NSObject
@@ -539,6 +1292,8 @@ static BOOL CAIsNotificationsNotAllowedError(NSError *error) {
 @property(nonatomic, assign) NSTimeInterval pollInterval;
 @property(nonatomic, assign) CAProxyMode proxyMode;
 @property(nonatomic, assign) CANotificationStatus notificationStatus;
+@property(nonatomic, copy) NSArray<CAThirdPartyAccount *> *thirdPartyAccounts;
+@property(nonatomic, copy) NSString *activeThirdPartyAccountID;
 @end
 
 @implementation AppDelegate
@@ -559,6 +1314,9 @@ static BOOL CAIsNotificationsNotAllowedError(NSError *error) {
 }
 
 - (NSString *)menuBarUsageTitle {
+    if ([self activeThirdPartyAccount]) {
+        return @"API";
+    }
     for (CAAccount *account in self.accounts) {
         if (account.active) {
             if (account.health != CAAccountHealthOK && account.health != CAAccountHealthUnknown) {
@@ -587,13 +1345,70 @@ static BOOL CAIsNotificationsNotAllowedError(NSError *error) {
     button.title = [self menuBarUsageTitle];
 }
 
+- (CAThirdPartyAccount *)activeThirdPartyAccount {
+    if (self.activeThirdPartyAccountID.length == 0) return nil;
+    for (CAThirdPartyAccount *account in self.thirdPartyAccounts) {
+        if ([account.identifier isEqualToString:self.activeThirdPartyAccountID]) {
+            return account;
+        }
+    }
+    return nil;
+}
+
+- (CAThirdPartyAccount *)thirdPartyAccountWithID:(NSString *)identifier {
+    if (identifier.length == 0) return nil;
+    for (CAThirdPartyAccount *account in self.thirdPartyAccounts) {
+        if ([account.identifier isEqualToString:identifier]) return account;
+    }
+    return nil;
+}
+
+- (NSArray<NSString *> *)thirdPartyProviderIDs {
+    NSMutableArray<NSString *> *ids = [NSMutableArray array];
+    for (CAThirdPartyAccount *account in self.thirdPartyAccounts) {
+        if (account.codexProviderID.length > 0) [ids addObject:account.codexProviderID];
+    }
+    return ids;
+}
+
+- (void)loadThirdPartyAccounts {
+    NSError *error = nil;
+    NSArray<CAThirdPartyAccount *> *accounts = [CAThirdPartyAccountStore loadAccounts:&error];
+    if (accounts) {
+        self.thirdPartyAccounts = accounts;
+    } else {
+        self.thirdPartyAccounts = @[];
+        self.lastError = error.localizedDescription;
+    }
+
+    NSString *activeID = [[NSUserDefaults standardUserDefaults] stringForKey:CAActiveThirdPartyAccountIDKey];
+    self.activeThirdPartyAccountID = [self thirdPartyAccountWithID:activeID] ? activeID : nil;
+}
+
+- (BOOL)saveThirdPartyAccounts:(NSError **)error {
+    return [CAThirdPartyAccountStore saveAccounts:self.thirdPartyAccounts ?: @[] error:error];
+}
+
+- (void)setActiveThirdPartyAccountIDAndPersist:(NSString *)identifier {
+    self.activeThirdPartyAccountID = identifier;
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    if (identifier.length > 0) {
+        [defaults setObject:identifier forKey:CAActiveThirdPartyAccountIDKey];
+    } else {
+        [defaults removeObjectForKey:CAActiveThirdPartyAccountIDKey];
+    }
+    [defaults synchronize];
+}
+
 - (void)applicationDidFinishLaunching:(NSNotification *)notification {
     self.manager = [[CodexAuthManager alloc] init];
     self.status = [[CAStatusSnapshot alloc] init];
     self.accounts = @[];
+    self.thirdPartyAccounts = @[];
     self.notificationStatus = CANotificationStatusNotDetermined;
     self.pollInterval = [self loadPollInterval];
     self.proxyMode = [self loadProxyMode];
+    [self loadThirdPartyAccounts];
     self.statusItem = [[NSStatusBar systemStatusBar] statusItemWithLength:NSVariableStatusItemLength];
     [self updateStatusItemButton];
 
@@ -643,6 +1458,58 @@ static BOOL CAIsNotificationsNotAllowedError(NSError *error) {
     });
 }
 
+- (void)showAlertWithTitle:(NSString *)title message:(NSString *)message {
+    NSAlert *alert = [[NSAlert alloc] init];
+    alert.messageText = title ?: @"CodexAuthMenu";
+    alert.informativeText = message ?: @"";
+    [alert addButtonWithTitle:@"OK"];
+    alert.alertStyle = NSAlertStyleInformational;
+    [alert runModal];
+}
+
+- (BOOL)restoreOfficialCodexConfigIfNeeded:(NSError **)error {
+    NSDictionary *snapshot = [[NSUserDefaults standardUserDefaults] dictionaryForKey:CAOfficialConfigSnapshotKey];
+    NSString *originalConfigText = nil;
+    BOOL configExisted = [[NSFileManager defaultManager] fileExistsAtPath:[CACodexConfigManager codexConfigPath]];
+    if ([snapshot isKindOfClass:[NSDictionary class]]) {
+        originalConfigText = [CACodexConfigManager readConfigText:error];
+        if (!originalConfigText && error && *error) return NO;
+
+        NSString *restored = [CACodexConfigManager configTextByRestoringSnapshot:snapshot
+                                                             removingProviderIDs:[self thirdPartyProviderIDs]
+                                                                        fromText:originalConfigText ?: @""];
+        if (![CACodexConfigManager writeConfigText:restored error:error]) return NO;
+    }
+
+    NSError *authError = nil;
+    if (![CACodexConfigManager restoreOfficialAuthIfNeeded:&authError]) {
+        if ([snapshot isKindOfClass:[NSDictionary class]]) {
+            NSError *rollbackError = nil;
+            BOOL rolledBack = configExisted
+                ? [CACodexConfigManager writeConfigText:originalConfigText ?: @"" error:&rollbackError]
+                : [[NSFileManager defaultManager] removeItemAtPath:[CACodexConfigManager codexConfigPath]
+                                                              error:&rollbackError];
+            if (!rolledBack && error) {
+                *error = [NSError errorWithDomain:CAErrorDomain
+                                             code:46
+                                         userInfo:@{NSLocalizedDescriptionKey:
+                                                        [NSString stringWithFormat:@"%@ Config rollback also failed: %@",
+                                                         authError.localizedDescription ?: @"Failed to restore official authentication.",
+                                                         rollbackError.localizedDescription ?: @"unknown error"]}];
+                return NO;
+            }
+        }
+        if (error) *error = authError;
+        return NO;
+    }
+
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    [defaults removeObjectForKey:CAOfficialConfigSnapshotKey];
+    [defaults removeObjectForKey:CAActiveThirdPartyAccountIDKey];
+    [defaults synchronize];
+    return YES;
+}
+
 - (void)switchAccount:(NSMenuItem *)sender {
     if (self.switching) return;
     NSString *account = sender.representedObject;
@@ -664,11 +1531,95 @@ static BOOL CAIsNotificationsNotAllowedError(NSError *error) {
 
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         NSError *error = nil;
-        BOOL success = [self.manager switchAccount:account error:&error];
+        BOOL restoredOfficial = [self restoreOfficialCodexConfigIfNeeded:&error];
+        BOOL success = restoredOfficial;
+        if (restoredOfficial) {
+            success = [self.manager switchAccount:account error:&error];
+        }
         dispatch_async(dispatch_get_main_queue(), ^{
             self.switching = NO;
-            if (success) [self refresh];
+            if (restoredOfficial) {
+                self.activeThirdPartyAccountID = nil;
+            }
+            if (success) {
+                [self refresh];
+            }
             else {
+                self.lastError = error.localizedDescription;
+                [self rebuildMenu];
+            }
+        });
+    });
+}
+
+- (void)switchThirdPartyAccount:(NSMenuItem *)sender {
+    if (self.switching) return;
+    NSString *identifier = sender.representedObject;
+    CAThirdPartyAccount *account = [self thirdPartyAccountWithID:identifier];
+    if (!account) return;
+
+    if ([account isChatCompletionsOnly]) {
+        [self showAlertWithTitle:@"Local Routing Required"
+                         message:@"This provider uses Chat Completions. Local routing is required and is not supported yet. This version only enables Responses API compatible providers."];
+        return;
+    }
+
+    NSAlert *alert = [[NSAlert alloc] init];
+    alert.messageText = @"Confirm Third Party Switch";
+    alert.informativeText = [NSString stringWithFormat:@"Switch Codex to Third Party provider %@ (%@)?\n\nCurrent Codex sessions may need to be restarted.", account.providerName, account.remark];
+    [alert addButtonWithTitle:@"Confirm Switch"];
+    [alert addButtonWithTitle:@"Cancel"];
+    alert.alertStyle = NSAlertStyleWarning;
+    if ([alert runModal] != NSAlertFirstButtonReturn) {
+        return;
+    }
+
+    self.switching = YES;
+    self.lastError = nil;
+    [self rebuildMenu];
+
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        NSError *error = nil;
+        NSString *apiKey = [CAThirdPartyAccountStore apiKeyForAccount:account error:&error];
+        BOOL success = apiKey != nil;
+        if (success) {
+            NSString *configText = [CACodexConfigManager readConfigText:&error];
+            success = configText != nil;
+            if (success) {
+                NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+                BOOL creatingOfficialSnapshot =
+                    self.activeThirdPartyAccountID.length == 0 &&
+                    ![defaults dictionaryForKey:CAOfficialConfigSnapshotKey];
+                if (creatingOfficialSnapshot) {
+                    [defaults setObject:[CACodexConfigManager snapshotFromConfigText:configText]
+                                 forKey:CAOfficialConfigSnapshotKey];
+                    [defaults synchronize];
+                }
+
+                success = [CACodexConfigManager backupOfficialAuthReplacingExisting:creatingOfficialSnapshot
+                                                                                error:&error];
+                NSString *updated = [CACodexConfigManager configTextByApplyingThirdPartyAccount:account
+                                                                                         apiKey:apiKey
+                                                                                         toText:configText
+                                                                                          error:&error];
+                success = success && updated != nil;
+                if (success) {
+                    success = [CACodexConfigManager writeThirdPartyConfigText:updated
+                                                                       apiKey:apiKey
+                                                                        error:&error];
+                }
+            }
+        }
+
+        dispatch_async(dispatch_get_main_queue(), ^{
+            self.switching = NO;
+            if (success) {
+                [self setActiveThirdPartyAccountIDAndPersist:account.identifier];
+                self.lastError = nil;
+                [self rebuildMenu];
+                [self showAlertWithTitle:@"Third Party Enabled"
+                                 message:@"Codex provider config has been updated. Restart existing Codex sessions to reload ~/.codex/config.toml."];
+            } else {
                 self.lastError = error.localizedDescription;
                 [self rebuildMenu];
             }
@@ -684,7 +1635,305 @@ static BOOL CAIsNotificationsNotAllowedError(NSError *error) {
     }
 }
 
-- (void)addNewAccount:(id)sender {
+- (NSString *)newThirdPartyIdentifier {
+    NSString *uuid = [[[NSUUID UUID] UUIDString] lowercaseString];
+    return [uuid stringByReplacingOccurrencesOfString:@"-" withString:@""];
+}
+
+- (NSString *)codexProviderIDForIdentifier:(NSString *)identifier {
+    NSString *suffix = identifier.length >= 12 ? [identifier substringToIndex:12] : identifier;
+    return [CACodexProviderIDPrefix stringByAppendingString:suffix];
+}
+
+- (NSString *)inferAPIFormatForProviderName:(NSString *)providerName endpointURL:(NSString *)endpointURL {
+    NSString *combined = [[NSString stringWithFormat:@"%@ %@", providerName ?: @"", endpointURL ?: @""] lowercaseString];
+    if ([combined containsString:@"chat/completions"] ||
+        [combined containsString:@"deepseek"] ||
+        [combined containsString:@"kimi"] ||
+        [combined containsString:@"moonshot"]) {
+        return CAThirdPartyAPIFormatChatValue;
+    }
+    return CAThirdPartyAPIFormatResponsesValue;
+}
+
+- (NSTextField *)labelWithString:(NSString *)label frame:(NSRect)frame {
+    NSTextField *field = [[NSTextField alloc] initWithFrame:frame];
+    field.stringValue = label ?: @"";
+    field.editable = NO;
+    field.bezeled = NO;
+    field.drawsBackground = NO;
+    field.alignment = NSTextAlignmentRight;
+    return field;
+}
+
+- (NSTextField *)textFieldWithString:(NSString *)value frame:(NSRect)frame placeholder:(NSString *)placeholder {
+    NSTextField *field = [[CAEditableTextField alloc] initWithFrame:frame];
+    field.stringValue = value ?: @"";
+    field.placeholderString = placeholder ?: @"";
+    return field;
+}
+
+- (NSTextField *)secureTextFieldWithString:(NSString *)value frame:(NSRect)frame placeholder:(NSString *)placeholder {
+    CASecureEditableTextField *field = [[CASecureEditableTextField alloc] initWithFrame:frame];
+    field.stringValue = value ?: @"";
+    field.placeholderString = placeholder ?: @"";
+    return field;
+}
+
+- (BOOL)deleteThirdPartyAccount:(CAThirdPartyAccount *)account error:(NSError **)error {
+    BOOL deletingActive = [self.activeThirdPartyAccountID isEqualToString:account.identifier];
+    if (deletingActive && ![self restoreOfficialCodexConfigIfNeeded:error]) {
+        return NO;
+    }
+    if (deletingActive) {
+        [self setActiveThirdPartyAccountIDAndPersist:nil];
+    }
+
+    NSMutableArray<CAThirdPartyAccount *> *remaining = [NSMutableArray array];
+    for (CAThirdPartyAccount *candidate in self.thirdPartyAccounts) {
+        if (![candidate.identifier isEqualToString:account.identifier]) {
+            [remaining addObject:candidate];
+        }
+    }
+    if (![CAThirdPartyAccountStore saveAccounts:remaining error:error]) return NO;
+    NSError *keyError = nil;
+    if (![CAThirdPartyAccountStore deleteAPIKeyForAccount:account error:&keyError]) {
+        NSError *rollbackError = nil;
+        BOOL rolledBack = [CAThirdPartyAccountStore saveAccounts:self.thirdPartyAccounts error:&rollbackError];
+        if (error) {
+            NSString *message = keyError.localizedDescription ?: @"Failed to delete API Key.";
+            if (!rolledBack) {
+                message = [message stringByAppendingFormat:@" Account list rollback also failed: %@",
+                                                        rollbackError.localizedDescription ?: @"unknown error"];
+            }
+            *error = [NSError errorWithDomain:CAErrorDomain
+                                         code:35
+                                     userInfo:@{NSLocalizedDescriptionKey: message}];
+        }
+        return NO;
+    }
+    self.thirdPartyAccounts = remaining;
+    return YES;
+}
+
+- (BOOL)rewriteConfigForActiveThirdPartyAccount:(CAThirdPartyAccount *)account error:(NSError **)error {
+    NSString *apiKey = [CAThirdPartyAccountStore apiKeyForAccount:account error:error];
+    if (!apiKey) return NO;
+    NSString *configText = [CACodexConfigManager readConfigText:error];
+    if (!configText) return NO;
+    NSString *updated = [CACodexConfigManager configTextByApplyingThirdPartyAccount:account
+                                                                             apiKey:apiKey
+                                                                             toText:configText
+                                                                              error:error];
+    if (!updated) return NO;
+    return [CACodexConfigManager writeThirdPartyConfigText:updated apiKey:apiKey error:error];
+}
+
+- (void)showThirdPartyAccountFormForAccount:(CAThirdPartyAccount *)existingAccount {
+    NSAlert *alert = [[NSAlert alloc] init];
+    alert.messageText = existingAccount ? @"Edit Third Party Account" : @"Add Third Party Account";
+    alert.informativeText = @"Initial support is for OpenAI Responses API compatible providers. DeepSeek/Kimi-style Chat Completions providers require local routing and cannot be enabled yet.";
+    [alert addButtonWithTitle:@"Save"];
+    [alert addButtonWithTitle:@"Cancel"];
+    if (existingAccount) [alert addButtonWithTitle:@"Delete"];
+    alert.alertStyle = NSAlertStyleInformational;
+
+    NSView *view = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 480, 282)];
+    CGFloat labelX = 0;
+    CGFloat fieldX = 150;
+    CGFloat width = 320;
+    CGFloat y = 248;
+    CGFloat row = 32;
+
+    NSTextField *remarkField = [self textFieldWithString:existingAccount.remark frame:NSMakeRect(fieldX, y, width, 24) placeholder:@"my-deepseek-key"];
+    [view addSubview:[self labelWithString:@"API Remark *" frame:NSMakeRect(labelX, y + 3, 140, 18)]];
+    [view addSubview:remarkField];
+
+    y -= row;
+    NSTextField *providerField = [self textFieldWithString:existingAccount.providerName frame:NSMakeRect(fieldX, y, width, 24) placeholder:@"DeepSeek / GLM / Custom"];
+    [view addSubview:[self labelWithString:@"Codex Provider Name *" frame:NSMakeRect(labelX, y + 3, 140, 18)]];
+    [view addSubview:providerField];
+
+    y -= row;
+    NSTextField *websiteField = [self textFieldWithString:existingAccount.websiteURL frame:NSMakeRect(fieldX, y, width, 24) placeholder:@"https://example.com"];
+    [view addSubview:[self labelWithString:@"Official Website" frame:NSMakeRect(labelX, y + 3, 140, 18)]];
+    [view addSubview:websiteField];
+
+    y -= row;
+    NSString *apiKeyPlaceholder = existingAccount ? @"••••••••  Paste a new API Key to replace" : @"sk-...";
+    CASecureEditableTextField *apiKeyField = (CASecureEditableTextField *)[self secureTextFieldWithString:@""
+                                                                                                    frame:NSMakeRect(fieldX, y, width, 24)
+                                                                                              placeholder:apiKeyPlaceholder];
+    [view addSubview:[self labelWithString:@"API Key *" frame:NSMakeRect(labelX, y + 3, 140, 18)]];
+    [view addSubview:apiKeyField];
+
+    NSTextField *apiKeyCountLabel = [self labelWithString:@"" frame:NSMakeRect(fieldX, y - 17, width, 16)];
+    apiKeyCountLabel.alignment = NSTextAlignmentLeft;
+    apiKeyCountLabel.textColor = [NSColor secondaryLabelColor];
+    apiKeyCountLabel.font = [NSFont systemFontOfSize:11];
+    [view addSubview:apiKeyCountLabel];
+    apiKeyField.characterCountLabel = apiKeyCountLabel;
+    if (existingAccount) {
+        apiKeyCountLabel.stringValue = @"Saved securely. Leave blank to keep it, or paste a new key.";
+    }
+
+    y -= 50;
+    NSPopUpButton *endpointTypePopup = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(fieldX, y, 180, 26) pullsDown:NO];
+    [endpointTypePopup addItemWithTitle:@"Base URL"];
+    [endpointTypePopup addItemWithTitle:@"Full URL"];
+    if ([existingAccount.endpointType isEqualToString:CAThirdPartyEndpointFullURLValue]) {
+        [endpointTypePopup selectItemWithTitle:@"Full URL"];
+    }
+    [view addSubview:[self labelWithString:@"Endpoint Type *" frame:NSMakeRect(labelX, y + 4, 140, 18)]];
+    [view addSubview:endpointTypePopup];
+
+    y -= row;
+    NSTextField *endpointField = [self textFieldWithString:existingAccount.endpointURL frame:NSMakeRect(fieldX, y, width, 24) placeholder:@"https://api.example.com/v1"];
+    [view addSubview:[self labelWithString:@"API Request URL *" frame:NSMakeRect(labelX, y + 3, 140, 18)]];
+    [view addSubview:endpointField];
+
+    y -= row;
+    NSTextField *modelField = [self textFieldWithString:existingAccount.modelName frame:NSMakeRect(fieldX, y, width, 24) placeholder:@"gpt-5.5"];
+    [view addSubview:[self labelWithString:@"Model Name *" frame:NSMakeRect(labelX, y + 3, 140, 18)]];
+    [view addSubview:modelField];
+
+    NSTextField *hint = [self labelWithString:@"Full URL must end with /responses or /v1/responses for direct Codex use."
+                                        frame:NSMakeRect(0, 0, 470, 18)];
+    hint.alignment = NSTextAlignmentLeft;
+    hint.textColor = [NSColor secondaryLabelColor];
+    [view addSubview:hint];
+
+    alert.accessoryView = view;
+
+    while (YES) {
+        NSModalResponse response = [alert runModal];
+        if (response == NSAlertSecondButtonReturn) return;
+
+        if (existingAccount && response == NSAlertThirdButtonReturn) {
+            NSAlert *confirm = [[NSAlert alloc] init];
+            confirm.messageText = @"Delete Third Party Account";
+            confirm.informativeText = [NSString stringWithFormat:@"Delete %@?", existingAccount.remark];
+            [confirm addButtonWithTitle:@"Delete"];
+            [confirm addButtonWithTitle:@"Cancel"];
+            confirm.alertStyle = NSAlertStyleWarning;
+            if ([confirm runModal] == NSAlertFirstButtonReturn) {
+                NSError *deleteError = nil;
+                if ([self deleteThirdPartyAccount:existingAccount error:&deleteError]) {
+                    self.lastError = nil;
+                } else {
+                    self.lastError = deleteError.localizedDescription;
+                }
+                [self rebuildMenu];
+            }
+            return;
+        }
+
+        NSString *remark = CATrimString(remarkField.stringValue);
+        NSString *providerName = CATrimString(providerField.stringValue);
+        NSString *websiteURL = CATrimString(websiteField.stringValue);
+        NSString *apiKey = CATrimString(apiKeyField.stringValue);
+        NSString *endpointURL = CATrimString(endpointField.stringValue);
+        NSString *modelName = CATrimString(modelField.stringValue);
+        NSString *endpointType = [[endpointTypePopup titleOfSelectedItem] isEqualToString:@"Full URL"] ? CAThirdPartyEndpointFullURLValue : CAThirdPartyEndpointBaseURLValue;
+
+        NSMutableArray<NSString *> *missing = [NSMutableArray array];
+        if (remark.length == 0) [missing addObject:@"API Remark"];
+        if (providerName.length == 0) [missing addObject:@"Codex Provider Name"];
+        if (!existingAccount && apiKey.length == 0) [missing addObject:@"API Key"];
+        if (endpointURL.length == 0) [missing addObject:@"API Request URL"];
+        if (modelName.length == 0) [missing addObject:@"Model Name"];
+        if (endpointType.length == 0) [missing addObject:@"Endpoint Type"];
+        if (missing.count > 0) {
+            [self showAlertWithTitle:@"Missing Required Fields"
+                             message:[NSString stringWithFormat:@"Please fill: %@", [missing componentsJoinedByString:@", "]]];
+            continue;
+        }
+
+        CAThirdPartyAccount *account = existingAccount
+            ? [CAThirdPartyAccount accountFromDictionary:[existingAccount dictionaryRepresentation]]
+            : [[CAThirdPartyAccount alloc] init];
+        if (!existingAccount) {
+            account.identifier = [self newThirdPartyIdentifier];
+            account.keychainIdentifier = account.identifier;
+            account.codexProviderID = [self codexProviderIDForIdentifier:account.identifier];
+        }
+        account.remark = remark;
+        account.providerName = providerName;
+        account.websiteURL = websiteURL;
+        account.endpointURL = endpointURL;
+        account.endpointType = endpointType;
+        account.modelName = modelName;
+        account.apiFormat = [self inferAPIFormatForProviderName:providerName endpointURL:endpointURL];
+
+        NSMutableArray<CAThirdPartyAccount *> *nextAccounts = [NSMutableArray arrayWithArray:self.thirdPartyAccounts ?: @[]];
+        if (existingAccount) {
+            NSUInteger index = [nextAccounts indexOfObjectIdenticalTo:existingAccount];
+            if (index == NSNotFound) {
+                [self showAlertWithTitle:@"Save Failed" message:@"The Third Party account is no longer available."];
+                return;
+            }
+            nextAccounts[index] = account;
+        } else {
+            [nextAccounts addObject:account];
+        }
+
+        NSError *saveError = nil;
+        NSString *previousAPIKey = nil;
+        if (existingAccount && apiKey.length > 0) {
+            previousAPIKey = [CAThirdPartyAccountStore apiKeyForAccount:existingAccount error:&saveError];
+            if (!previousAPIKey) {
+                [self showAlertWithTitle:@"Save Failed" message:saveError.localizedDescription ?: @"Failed to read the existing API Key."];
+                continue;
+            }
+        }
+
+        if (![CAThirdPartyAccountStore saveAccounts:nextAccounts error:&saveError]) {
+            [self showAlertWithTitle:@"Save Failed" message:saveError.localizedDescription ?: @"Failed to save Third Party account."];
+            continue;
+        }
+
+        if (apiKey.length > 0 && ![CAThirdPartyAccountStore saveAPIKey:apiKey forAccount:account error:&saveError]) {
+            [CAThirdPartyAccountStore saveAccounts:self.thirdPartyAccounts error:nil];
+            if (existingAccount) {
+                [CAThirdPartyAccountStore saveAPIKey:previousAPIKey ?: @"" forAccount:existingAccount error:nil];
+            } else {
+                [CAThirdPartyAccountStore deleteAPIKeyForAccount:account error:nil];
+            }
+            [self showAlertWithTitle:@"Save Failed" message:saveError.localizedDescription ?: @"Failed to save the API Key."];
+            continue;
+        }
+
+        if ([self.activeThirdPartyAccountID isEqualToString:account.identifier]) {
+            NSError *rewriteError = nil;
+            if (![self rewriteConfigForActiveThirdPartyAccount:account error:&rewriteError]) {
+                NSError *rollbackError = nil;
+                BOOL accountsRolledBack = [CAThirdPartyAccountStore saveAccounts:self.thirdPartyAccounts error:&rollbackError];
+                BOOL keyRolledBack = YES;
+                if (apiKey.length > 0) {
+                    keyRolledBack = [CAThirdPartyAccountStore saveAPIKey:previousAPIKey ?: @""
+                                                             forAccount:existingAccount
+                                                                  error:&rollbackError];
+                }
+                NSString *message = rewriteError.localizedDescription ?: @"Failed to rewrite the active Codex provider config.";
+                if (!accountsRolledBack || !keyRolledBack) {
+                    message = [message stringByAppendingFormat:@" Saved account rollback also failed: %@",
+                                                            rollbackError.localizedDescription ?: @"unknown error"];
+                }
+                [self showAlertWithTitle:@"Save Failed" message:message];
+                continue;
+            }
+            [self showAlertWithTitle:@"Third Party Account Updated"
+                             message:@"The active Codex provider config has been rewritten. Restart existing Codex sessions to reload the updated values."];
+        }
+
+        self.thirdPartyAccounts = nextAccounts;
+        self.lastError = nil;
+        [self rebuildMenu];
+        return;
+    }
+}
+
+- (void)startCodexAccountLogin {
     NSError *error = nil;
     if (![self.manager startLoginInTerminal:&error]) {
         self.lastError = error.localizedDescription;
@@ -694,6 +1943,28 @@ static BOOL CAIsNotificationsNotAllowedError(NSError *error) {
 
     self.lastError = nil;
     [self rebuildMenu];
+}
+
+- (void)addNewAccount:(id)sender {
+    NSAlert *alert = [[NSAlert alloc] init];
+    alert.messageText = @"Add New Account";
+    alert.informativeText = @"Choose the account type to add.";
+    [alert addButtonWithTitle:@"Codex Account"];
+    [alert addButtonWithTitle:@"Third Party Account"];
+    [alert addButtonWithTitle:@"Cancel"];
+    alert.alertStyle = NSAlertStyleInformational;
+
+    NSModalResponse response = [alert runModal];
+    if (response == NSAlertFirstButtonReturn) {
+        [self startCodexAccountLogin];
+    } else if (response == NSAlertSecondButtonReturn) {
+        [self showThirdPartyAccountFormForAccount:nil];
+    }
+}
+
+- (void)editThirdPartyAccount:(NSMenuItem *)sender {
+    CAThirdPartyAccount *account = [self thirdPartyAccountWithID:sender.representedObject];
+    if (account) [self showThirdPartyAccountFormForAccount:account];
 }
 
 - (void)quit:(id)sender {
@@ -897,11 +2168,6 @@ static BOOL CAIsNotificationsNotAllowedError(NSError *error) {
         NSFontAttributeName: [NSFont menuFontOfSize:0]
     };
 
-    NSInteger fiveHourUsage = [self usagePercentFromString:account.usage5h];
-    NSInteger weeklyUsage = [self usagePercentFromString:account.weeklyUsage];
-    NSString *fiveHourTime = [self timeComponentFromUsage:account.usage5h];
-    NSString *weeklyTime = [self dateComponentFromWeeklyUsage:account.weeklyUsage];
-
     NSMutableAttributedString *result = [[NSMutableAttributedString alloc] initWithString:[NSString stringWithFormat:@"%@\t", account.account]
                                                                                 attributes:leftAttributes];
     [result appendAttributedString:[[NSAttributedString alloc] initWithString:@" " attributes:leftAttributes]];
@@ -1001,6 +2267,24 @@ static BOOL CAIsNotificationsNotAllowedError(NSError *error) {
     return [[NSAttributedString alloc] initWithString:text attributes:attributes];
 }
 
+- (NSAttributedString *)thirdPartyTagAttributedString {
+    NSDictionary *attributes = @{
+        NSFontAttributeName: [NSFont systemFontOfSize:[NSFont smallSystemFontSize] weight:NSFontWeightMedium],
+        NSForegroundColorAttributeName: [NSColor colorWithCalibratedRed:CAThirdPartyTagFgRed green:CAThirdPartyTagFgGreen blue:CAThirdPartyTagFgBlue alpha:1.0],
+        NSBackgroundColorAttributeName: [NSColor colorWithCalibratedRed:CAThirdPartyTagBgRed green:CAThirdPartyTagBgGreen blue:CAThirdPartyTagBgBlue alpha:1.0]
+    };
+    return [[NSAttributedString alloc] initWithString:@" Third Party " attributes:attributes];
+}
+
+- (NSAttributedString *)requiresRoutingTagAttributedString {
+    NSDictionary *attributes = @{
+        NSFontAttributeName: [NSFont systemFontOfSize:[NSFont smallSystemFontSize] weight:NSFontWeightMedium],
+        NSForegroundColorAttributeName: [NSColor colorWithCalibratedRed:CAErrorTagFgRed green:CAErrorTagFgGreen blue:CAErrorTagFgBlue alpha:1.0],
+        NSBackgroundColorAttributeName: [NSColor colorWithCalibratedRed:CAErrorTagBgRed green:CAErrorTagBgGreen blue:CAErrorTagBgBlue alpha:1.0]
+    };
+    return [[NSAttributedString alloc] initWithString:@" Requires Routing " attributes:attributes];
+}
+
 - (NSAttributedString *)currentAccountHeaderForAccount:(CAAccount *)account {
     NSMutableParagraphStyle *paragraphStyle = [[NSMutableParagraphStyle alloc] init];
     paragraphStyle.tabStops = @[
@@ -1016,6 +2300,43 @@ static BOOL CAIsNotificationsNotAllowedError(NSError *error) {
     NSMutableAttributedString *result = [[NSMutableAttributedString alloc] initWithString:@"Current Account\t"
                                                                                 attributes:leftAttributes];
     [result appendAttributedString:[self planTagAttributedStringForPlan:account.plan]];
+    return result;
+}
+
+- (NSAttributedString *)currentAccountHeaderForThirdPartyAccount:(CAThirdPartyAccount *)account {
+    NSMutableParagraphStyle *paragraphStyle = [[NSMutableParagraphStyle alloc] init];
+    paragraphStyle.tabStops = @[
+        [[NSTextTab alloc] initWithTextAlignment:NSTextAlignmentRight location:CAAlignedMenuTabLocation options:@{}]
+    ];
+    paragraphStyle.defaultTabInterval = CAAlignedMenuTabLocation;
+
+    NSDictionary *leftAttributes = @{
+        NSParagraphStyleAttributeName: paragraphStyle,
+        NSFontAttributeName: [NSFont menuFontOfSize:0]
+    };
+
+    NSMutableAttributedString *result = [[NSMutableAttributedString alloc] initWithString:@"Current Account\t"
+                                                                                attributes:leftAttributes];
+    [result appendAttributedString:[self planTagAttributedStringForPlan:account.providerName]];
+    return result;
+}
+
+- (NSAttributedString *)switchAccountTitleForThirdPartyAccount:(CAThirdPartyAccount *)account {
+    NSMutableParagraphStyle *paragraphStyle = [[NSMutableParagraphStyle alloc] init];
+    paragraphStyle.tabStops = @[
+        [[NSTextTab alloc] initWithTextAlignment:NSTextAlignmentRight location:CASwitchAccountTabLocation options:@{}]
+    ];
+    paragraphStyle.defaultTabInterval = CASwitchAccountTabLocation;
+
+    NSDictionary *leftAttributes = @{
+        NSParagraphStyleAttributeName: paragraphStyle,
+        NSFontAttributeName: [NSFont menuFontOfSize:0]
+    };
+
+    NSMutableAttributedString *result = [[NSMutableAttributedString alloc] initWithString:[NSString stringWithFormat:@"%@\t", account.remark]
+                                                                                attributes:leftAttributes];
+    [result appendAttributedString:[[NSAttributedString alloc] initWithString:@" " attributes:leftAttributes]];
+    [result appendAttributedString:([account isChatCompletionsOnly] ? [self requiresRoutingTagAttributedString] : [self thirdPartyTagAttributedString])];
     return result;
 }
 
@@ -1193,6 +2514,7 @@ static BOOL CAIsNotificationsNotAllowedError(NSError *error) {
 - (void)rebuildMenu {
     [self updateStatusItemButton];
     NSMenu *menu = [[NSMenu alloc] init];
+    CAThirdPartyAccount *activeThirdParty = [self activeThirdPartyAccount];
     CAAccount *active = nil;
     for (CAAccount *account in self.accounts) {
         if (account.active) {
@@ -1201,15 +2523,16 @@ static BOOL CAIsNotificationsNotAllowedError(NSError *error) {
         }
     }
 
-    if (active) {
+    if (activeThirdParty || active) {
         NSMenuItem *currentHeaderItem = [[NSMenuItem alloc] initWithTitle:@"Current Account" action:nil keyEquivalent:@""];
         currentHeaderItem.enabled = NO;
-        currentHeaderItem.attributedTitle = [self currentAccountHeaderForAccount:active];
+        currentHeaderItem.attributedTitle = activeThirdParty ? [self currentAccountHeaderForThirdPartyAccount:activeThirdParty] : [self currentAccountHeaderForAccount:active];
         [menu addItem:currentHeaderItem];
 
-        NSMenuItem *headerItem = [[NSMenuItem alloc] initWithTitle:active.account action:nil keyEquivalent:@""];
+        NSString *headerTitle = activeThirdParty ? activeThirdParty.remark : active.account;
+        NSMenuItem *headerItem = [[NSMenuItem alloc] initWithTitle:headerTitle action:nil keyEquivalent:@""];
         NSMenu *switchAccountSubmenu = [[NSMenu alloc] initWithTitle:@"Switch Account"];
-        if (self.accounts.count == 0) {
+        if (self.accounts.count == 0 && self.thirdPartyAccounts.count == 0) {
             NSMenuItem *emptyItem = [[NSMenuItem alloc] initWithTitle:(self.refreshing ? @"Refreshing..." : @"No accounts found")
                                                                action:nil
                                                         keyEquivalent:@""];
@@ -1220,20 +2543,36 @@ static BOOL CAIsNotificationsNotAllowedError(NSError *error) {
                 NSMenuItem *item = [[NSMenuItem alloc] initWithTitle:account.account action:@selector(switchAccount:) keyEquivalent:@""];
                 item.target = self;
                 item.representedObject = account.account;
-                item.enabled = !account.active && !self.switching;
-                item.state = account.active ? NSControlStateValueOn : NSControlStateValueOff;
+                item.enabled = (activeThirdParty != nil || !account.active) && !self.switching;
+                item.state = (!activeThirdParty && account.active) ? NSControlStateValueOn : NSControlStateValueOff;
                 item.attributedTitle = [self switchAccountTitleForAccount:account];
+                [switchAccountSubmenu addItem:item];
+            }
+            if (self.accounts.count > 0 && self.thirdPartyAccounts.count > 0) {
+                [switchAccountSubmenu addItem:[NSMenuItem separatorItem]];
+            }
+            for (CAThirdPartyAccount *thirdParty in self.thirdPartyAccounts) {
+                NSMenuItem *item = [[NSMenuItem alloc] initWithTitle:thirdParty.remark
+                                                              action:@selector(switchThirdPartyAccount:)
+                                                       keyEquivalent:@""];
+                item.target = self;
+                item.representedObject = thirdParty.identifier;
+                BOOL isActiveThirdParty = activeThirdParty != nil &&
+                    [thirdParty.identifier isEqualToString:activeThirdParty.identifier];
+                item.enabled = !isActiveThirdParty && !self.switching;
+                item.state = isActiveThirdParty ? NSControlStateValueOn : NSControlStateValueOff;
+                item.attributedTitle = [self switchAccountTitleForThirdPartyAccount:thirdParty];
                 [switchAccountSubmenu addItem:item];
             }
         }
         headerItem.submenu = switchAccountSubmenu;
         [menu addItem:headerItem];
-        if (active.health != CAAccountHealthOK) {
+        if (!activeThirdParty && active.health != CAAccountHealthOK) {
             NSMenuItem *errorItem = [[NSMenuItem alloc] initWithTitle:@"账号状态" action:nil keyEquivalent:@""];
             errorItem.enabled = NO;
             errorItem.attributedTitle = [self currentAccountErrorLineForAccount:active];
             [menu addItem:errorItem];
-        } else {
+        } else if (!activeThirdParty) {
             [self addStaticItem:[self currentAccountUsageLineWithLabel:@"5H"
                                                              usageText:active.usage5h
                                                            timeDisplay:[self timeComponentFromUsage:active.usage5h]]
@@ -1245,7 +2584,37 @@ static BOOL CAIsNotificationsNotAllowedError(NSError *error) {
         }
     } else {
         [self addStaticItem:@"Current Account" toMenu:menu];
-        [self addStaticItem:(self.refreshing ? @"Refreshing..." : @"No active account") toMenu:menu];
+        NSMenuItem *headerItem = [[NSMenuItem alloc] initWithTitle:(self.refreshing ? @"Refreshing..." : @"No active account")
+                                                            action:nil
+                                                     keyEquivalent:@""];
+        if (self.accounts.count > 0 || self.thirdPartyAccounts.count > 0) {
+            NSMenu *switchAccountSubmenu = [[NSMenu alloc] initWithTitle:@"Switch Account"];
+            for (CAAccount *account in self.accounts) {
+                NSMenuItem *item = [[NSMenuItem alloc] initWithTitle:account.account action:@selector(switchAccount:) keyEquivalent:@""];
+                item.target = self;
+                item.representedObject = account.account;
+                item.enabled = !self.switching;
+                item.attributedTitle = [self switchAccountTitleForAccount:account];
+                [switchAccountSubmenu addItem:item];
+            }
+            if (self.accounts.count > 0 && self.thirdPartyAccounts.count > 0) {
+                [switchAccountSubmenu addItem:[NSMenuItem separatorItem]];
+            }
+            for (CAThirdPartyAccount *thirdParty in self.thirdPartyAccounts) {
+                NSMenuItem *item = [[NSMenuItem alloc] initWithTitle:thirdParty.remark
+                                                              action:@selector(switchThirdPartyAccount:)
+                                                       keyEquivalent:@""];
+                item.target = self;
+                item.representedObject = thirdParty.identifier;
+                item.enabled = !self.switching;
+                item.attributedTitle = [self switchAccountTitleForThirdPartyAccount:thirdParty];
+                [switchAccountSubmenu addItem:item];
+            }
+            headerItem.submenu = switchAccountSubmenu;
+        } else {
+            headerItem.enabled = NO;
+        }
+        [menu addItem:headerItem];
     }
 
     [menu addItem:[NSMenuItem separatorItem]];
@@ -1312,6 +2681,23 @@ static BOOL CAIsNotificationsNotAllowedError(NSError *error) {
     addAccountItem.enabled = !self.switching;
     [menu addItem:addAccountItem];
 
+    if (self.thirdPartyAccounts.count > 0) {
+        NSMenuItem *manageThirdPartyItem = [[NSMenuItem alloc] initWithTitle:@"Manage Third Party Account"
+                                                                      action:nil
+                                                               keyEquivalent:@""];
+        NSMenu *manageThirdPartySubmenu = [[NSMenu alloc] initWithTitle:@"Manage Third Party Account"];
+        for (CAThirdPartyAccount *thirdParty in self.thirdPartyAccounts) {
+            NSMenuItem *item = [[NSMenuItem alloc] initWithTitle:thirdParty.remark
+                                                          action:@selector(editThirdPartyAccount:)
+                                                   keyEquivalent:@""];
+            item.target = self;
+            item.representedObject = thirdParty.identifier;
+            [manageThirdPartySubmenu addItem:item];
+        }
+        manageThirdPartyItem.submenu = manageThirdPartySubmenu;
+        [menu addItem:manageThirdPartyItem];
+    }
+
     NSString *updated = [self formattedUpdatedAt];
     if (updated) [self addStaticItem:[NSString stringWithFormat:@"Updated: %@", updated] toMenu:menu];
     if (self.lastError.length > 0) [self addStaticItem:[NSString stringWithFormat:@"Error: %@", self.lastError] toMenu:menu];
@@ -1326,8 +2712,65 @@ static BOOL CAIsNotificationsNotAllowedError(NSError *error) {
 
 @end
 
+static int CARunConfigRoundTripVerification(void) {
+    CAThirdPartyAccount *account = [[CAThirdPartyAccount alloc] init];
+    account.identifier = @"verify";
+    account.remark = @"verify-provider";
+    account.providerName = @"VerifyProvider";
+    account.endpointURL = @"https://api.verify.example/v1";
+    account.endpointType = CAThirdPartyEndpointBaseURLValue;
+    account.modelName = @"verify-model";
+    account.apiFormat = CAThirdPartyAPIFormatResponsesValue;
+    account.keychainIdentifier = @"verify";
+    account.codexProviderID = @"codex_auth_menu_verify";
+
+    NSString *original = @"sandbox_mode = \"workspace-write\"\n"
+                         "model_provider = \"openai\"\n"
+                         "model = \"gpt-5.5\"\n"
+                         "\n"
+                         "[model_providers.codex_auth_menu_deleted]\n"
+                         "name = \"stale\"\n"
+                         "base_url = \"https://stale.example\"\n"
+                         "\n"
+                         "[mcp_servers.demo]\n"
+                         "command = \"demo\"\n";
+    NSDictionary *snapshot = [CACodexConfigManager snapshotFromConfigText:original];
+    NSError *error = nil;
+    NSString *applied = [CACodexConfigManager configTextByApplyingThirdPartyAccount:account
+                                                                             apiKey:@"sk-verify"
+                                                                             toText:original
+                                                                              error:&error];
+    if (!applied ||
+        ![applied containsString:@"model_provider = \"codex_auth_menu_verify\""] ||
+        ![applied containsString:@"[model_providers.codex_auth_menu_verify]"] ||
+        [applied containsString:@"codex_auth_menu_deleted"] ||
+        [applied containsString:@"experimental_bearer_token"] ||
+        ![applied containsString:@"[mcp_servers.demo]"]) {
+        fprintf(stderr, "Third Party config apply verification failed: %s\n", error.localizedDescription.UTF8String ?: "");
+        return 1;
+    }
+
+    NSString *restored = [CACodexConfigManager configTextByRestoringSnapshot:snapshot
+                                                         removingProviderIDs:@[account.codexProviderID]
+                                                                    fromText:applied];
+    if (![restored containsString:@"model_provider = \"openai\""] ||
+        ![restored containsString:@"model = \"gpt-5.5\""] ||
+        ![restored containsString:@"[mcp_servers.demo]"] ||
+        [restored containsString:@"codex_auth_menu_verify"] ||
+        [restored containsString:@"disable_response_storage"]) {
+        fprintf(stderr, "Official config restore verification failed.\n");
+        return 1;
+    }
+
+    printf("Config roundtrip verification passed.\n");
+    return 0;
+}
+
 int main(int argc, const char *argv[]) {
     @autoreleasepool {
+        if (argc > 1 && strcmp(argv[1], "--verify-config-roundtrip") == 0) {
+            return CARunConfigRoundTripVerification();
+        }
         NSApplication *app = [NSApplication sharedApplication];
         AppDelegate *delegate = [[AppDelegate alloc] init];
         app.delegate = delegate;

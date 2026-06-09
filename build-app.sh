@@ -15,6 +15,7 @@ clang \
   -fobjc-arc \
   -framework AppKit \
   -framework CFNetwork \
+  -framework Security \
   -framework UserNotifications \
   Sources/main.m \
   -o "$ROOT_DIR/CodexAuthMenu"
