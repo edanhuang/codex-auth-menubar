@@ -4,6 +4,9 @@
 
 static NSString *const CAErrorDomain = @"CodexAuthMenu";
 static NSString *const CADefaultPollIntervalKey = @"pollIntervalSeconds";
+static NSString *const CAProxyModeKey = @"proxyMode";
+static NSString *const CAProxyModeDirectValue = @"direct";
+static NSString *const CAProxyModeSystemValue = @"system";
 static NSString *const CANotificationDedupKey = @"notificationDedupByAccount";
 static NSString *const CACliName = @"codex-auth";
 static NSString *const CANodeName = @"node";
@@ -57,6 +60,11 @@ typedef NS_ENUM(NSInteger, CANotificationStatus) {
     CANotificationStatusNotDetermined = 0,
     CANotificationStatusEnabled = 1,
     CANotificationStatusDenied = 2,
+};
+
+typedef NS_ENUM(NSInteger, CAProxyMode) {
+    CAProxyModeDirect = 0,
+    CAProxyModeSystem = 1,
 };
 
 static BOOL CAIsNotificationsNotAllowedError(NSError *error) {
@@ -286,15 +294,69 @@ static BOOL CAIsNotificationsNotAllowedError(NSError *error) {
     return YES;
 }
 
-- (NSString *)systemProxyURL {
-    NSDictionary *services = (__bridge_transfer NSDictionary *)CFNetworkCopySystemProxySettings();
-    if (!services) return nil;
-    NSNumber *httpEnable = services[(__bridge NSString *)kCFNetworkProxiesHTTPEnable];
-    if (![httpEnable boolValue]) return nil;
-    NSString *host = services[(__bridge NSString *)kCFNetworkProxiesHTTPProxy];
-    NSNumber *port = services[(__bridge NSString *)kCFNetworkProxiesHTTPPort];
+- (NSString *)proxyURLFromSettings:(NSDictionary *)settings
+                         enableKey:(NSString *)enableKey
+                           hostKey:(NSString *)hostKey
+                           portKey:(NSString *)portKey {
+    NSNumber *enabled = settings[enableKey];
+    if (![enabled boolValue]) return nil;
+    NSString *host = settings[hostKey];
+    NSNumber *port = settings[portKey];
     if (!host || host.length == 0 || !port) return nil;
     return [NSString stringWithFormat:@"http://%@:%@", host, port];
+}
+
+- (NSDictionary<NSString *, NSString *> *)systemProxyURLs {
+    NSDictionary *services = (__bridge_transfer NSDictionary *)CFNetworkCopySystemProxySettings();
+    if (!services) return @{};
+
+    NSMutableDictionary<NSString *, NSString *> *urls = [NSMutableDictionary dictionary];
+    NSString *httpProxy = [self proxyURLFromSettings:services
+                                          enableKey:@"HTTPEnable"
+                                            hostKey:@"HTTPProxy"
+                                            portKey:@"HTTPPort"];
+    NSString *httpsProxy = [self proxyURLFromSettings:services
+                                           enableKey:@"HTTPSEnable"
+                                             hostKey:@"HTTPSProxy"
+                                             portKey:@"HTTPSPort"];
+    if (httpProxy.length > 0) urls[@"http"] = httpProxy;
+    if (httpsProxy.length > 0) urls[@"https"] = httpsProxy;
+    return urls;
+}
+
+- (CAProxyMode)loadProxyMode {
+    NSString *saved = [[NSUserDefaults standardUserDefaults] stringForKey:CAProxyModeKey];
+    if ([saved isEqualToString:CAProxyModeSystemValue]) return CAProxyModeSystem;
+    return CAProxyModeDirect;
+}
+
+- (void)removeProxyEnvironment:(NSMutableDictionary *)env {
+    for (NSString *key in @[@"HTTP_PROXY", @"HTTPS_PROXY", @"ALL_PROXY", @"http_proxy", @"https_proxy", @"all_proxy"]) {
+        [env removeObjectForKey:key];
+    }
+}
+
+- (void)configureProxyEnvironment:(NSMutableDictionary *)env {
+    [self removeProxyEnvironment:env];
+    if ([self loadProxyMode] != CAProxyModeSystem) return;
+
+    NSDictionary<NSString *, NSString *> *proxyURLs = [self systemProxyURLs];
+    NSString *httpProxy = proxyURLs[@"http"];
+    NSString *httpsProxy = proxyURLs[@"https"] ?: httpProxy;
+    NSString *allProxy = httpsProxy ?: httpProxy;
+
+    if (httpProxy.length > 0) {
+        env[@"HTTP_PROXY"] = httpProxy;
+        env[@"http_proxy"] = httpProxy;
+    }
+    if (httpsProxy.length > 0) {
+        env[@"HTTPS_PROXY"] = httpsProxy;
+        env[@"https_proxy"] = httpsProxy;
+    }
+    if (allProxy.length > 0) {
+        env[@"ALL_PROXY"] = allProxy;
+        env[@"all_proxy"] = allProxy;
+    }
 }
 
 - (NSString *)run:(NSArray<NSString *> *)arguments error:(NSError **)error {
@@ -307,12 +369,7 @@ static BOOL CAIsNotificationsNotAllowedError(NSError *error) {
     task.arguments = @[ @"-l", @"-c", joinedCmd ];
 
     NSMutableDictionary *env = [[[NSProcessInfo processInfo] environment] mutableCopy];
-    NSString *proxyURL = [self systemProxyURL];
-    if (proxyURL.length > 0) {
-        if (!env[@"http_proxy"]) env[@"http_proxy"] = proxyURL;
-        if (!env[@"https_proxy"]) env[@"https_proxy"] = proxyURL;
-        if (!env[@"ALL_PROXY"]) env[@"ALL_PROXY"] = proxyURL;
-    }
+    [self configureProxyEnvironment:env];
     task.environment = env;
 
     NSPipe *outputPipe = [NSPipe pipe];
@@ -480,6 +537,7 @@ static BOOL CAIsNotificationsNotAllowedError(NSError *error) {
 @property(nonatomic, assign) BOOL refreshing;
 @property(nonatomic, assign) BOOL switching;
 @property(nonatomic, assign) NSTimeInterval pollInterval;
+@property(nonatomic, assign) CAProxyMode proxyMode;
 @property(nonatomic, assign) CANotificationStatus notificationStatus;
 @end
 
@@ -535,6 +593,7 @@ static BOOL CAIsNotificationsNotAllowedError(NSError *error) {
     self.accounts = @[];
     self.notificationStatus = CANotificationStatusNotDetermined;
     self.pollInterval = [self loadPollInterval];
+    self.proxyMode = [self loadProxyMode];
     self.statusItem = [[NSStatusBar systemStatusBar] statusItemWithLength:NSVariableStatusItemLength];
     [self updateStatusItemButton];
 
@@ -652,6 +711,21 @@ static BOOL CAIsNotificationsNotAllowedError(NSError *error) {
     [self rebuildMenu];
 }
 
+- (void)changeProxyMode:(NSMenuItem *)sender {
+    NSString *value = sender.representedObject;
+    if (![value isKindOfClass:[NSString class]]) return;
+
+    CAProxyMode nextMode = [value isEqualToString:CAProxyModeSystemValue] ? CAProxyModeSystem : CAProxyModeDirect;
+    if (self.proxyMode == nextMode) return;
+
+    self.proxyMode = nextMode;
+    [[NSUserDefaults standardUserDefaults] setObject:value forKey:CAProxyModeKey];
+    [[NSUserDefaults standardUserDefaults] synchronize];
+    self.lastError = nil;
+    [self rebuildMenu];
+    [self refresh];
+}
+
 - (NSString *)menuBarTitle {
     return [self menuBarUsageTitle];
 }
@@ -678,6 +752,12 @@ static BOOL CAIsNotificationsNotAllowedError(NSError *error) {
         if (fabs(value.doubleValue - savedInterval) < DBL_EPSILON) return value.doubleValue;
     }
     return CADefaultPollInterval;
+}
+
+- (CAProxyMode)loadProxyMode {
+    NSString *saved = [[NSUserDefaults standardUserDefaults] stringForKey:CAProxyModeKey];
+    if ([saved isEqualToString:CAProxyModeSystemValue]) return CAProxyModeSystem;
+    return CAProxyModeDirect;
 }
 
 - (NSArray<NSNumber *> *)supportedPollIntervals {
@@ -1182,6 +1262,28 @@ static BOOL CAIsNotificationsNotAllowedError(NSError *error) {
     }
     queryIntervalItem.submenu = queryIntervalSubmenu;
     [menu addItem:queryIntervalItem];
+
+    NSMenuItem *proxyModeItem = [[NSMenuItem alloc] initWithTitle:@"Proxy Mode" action:nil keyEquivalent:@""];
+    NSMenu *proxyModeSubmenu = [[NSMenu alloc] initWithTitle:@"Proxy Mode"];
+    NSArray<NSDictionary<NSString *, NSString *> *> *proxyModes = @[
+        @{@"title": @"Direct", @"value": CAProxyModeDirectValue},
+        @{@"title": @"System Proxy", @"value": CAProxyModeSystemValue}
+    ];
+    for (NSDictionary<NSString *, NSString *> *proxyMode in proxyModes) {
+        NSString *value = proxyMode[@"value"];
+        NSMenuItem *item = [[NSMenuItem alloc] initWithTitle:proxyMode[@"title"]
+                                                      action:@selector(changeProxyMode:)
+                                               keyEquivalent:@""];
+        item.target = self;
+        item.representedObject = value;
+        item.state = (([value isEqualToString:CAProxyModeSystemValue] && self.proxyMode == CAProxyModeSystem) ||
+                      ([value isEqualToString:CAProxyModeDirectValue] && self.proxyMode == CAProxyModeDirect))
+                     ? NSControlStateValueOn
+                     : NSControlStateValueOff;
+        [proxyModeSubmenu addItem:item];
+    }
+    proxyModeItem.submenu = proxyModeSubmenu;
+    [menu addItem:proxyModeItem];
 
     [menu addItem:[NSMenuItem separatorItem]];
     NSString *toggleTitle = [[self.status.autoSwitch uppercaseString] isEqualToString:@"ON"] ? @"Disable Auto Switch" : @"Enable Auto Switch";
