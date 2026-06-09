@@ -6,6 +6,22 @@ static NSString *const CAFixedNodePath = @"/usr/local/bin/node";
 static NSString *const CADefaultPollIntervalKey = @"pollIntervalSeconds";
 static NSString *const CANotificationDedupKey = @"notificationDedupByAccount";
 
+static const CGFloat CAErrorTagBgRed = 0.95;
+static const CGFloat CAErrorTagBgGreen = 0.88;
+static const CGFloat CAErrorTagBgBlue = 0.88;
+static const CGFloat CAErrorTagFgRed = 0.65;
+static const CGFloat CAErrorTagFgGreen = 0.15;
+static const CGFloat CAErrorTagFgBlue = 0.15;
+
+typedef NS_ENUM(NSInteger, CAAccountHealth) {
+    CAAccountHealthOK = 0,
+    CAAccountHealthAuthFailed = 1,
+    CAAccountHealthForbidden = 2,
+    CAAccountHealthRateLimited = 3,
+    CAAccountHealthNetworkError = 4,
+    CAAccountHealthUnknown = 5,
+};
+
 typedef NS_ENUM(NSInteger, CANotificationStatus) {
     CANotificationStatusNotDetermined = 0,
     CANotificationStatusEnabled = 1,
@@ -20,12 +36,14 @@ static BOOL CAIsNotificationsNotAllowedError(NSError *error) {
 
 @interface CAAccount : NSObject
 @property(nonatomic, assign) BOOL active;
+@property(nonatomic, assign) CAAccountHealth health;
 @property(nonatomic, copy) NSString *index;
 @property(nonatomic, copy) NSString *account;
 @property(nonatomic, copy) NSString *plan;
 @property(nonatomic, copy) NSString *usage5h;
 @property(nonatomic, copy) NSString *weeklyUsage;
 @property(nonatomic, copy) NSString *lastActivity;
+@property(nonatomic, copy) NSString *errorMessage;
 @end
 
 @implementation CAAccount
@@ -256,6 +274,44 @@ static BOOL CAIsNotificationsNotAllowedError(NSError *error) {
     return snapshot;
 }
 
+- (CAAccountHealth)healthFromUsageField:(NSString *)field message:(NSString **)outMessage {
+    if (!field || field.length == 0) {
+        if (outMessage) *outMessage = nil;
+        return CAAccountHealthOK;
+    }
+    NSString *trimmed = [field stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+    if (trimmed.length == 0 || [trimmed isEqualToString:@"-"]) {
+        if (outMessage) *outMessage = nil;
+        return CAAccountHealthOK;
+    }
+    if ([trimmed containsString:@"%"]) {
+        if (outMessage) *outMessage = nil;
+        return CAAccountHealthOK;
+    }
+    if ([trimmed isEqualToString:@"401"] || [trimmed containsString:@"401"]) {
+        if (outMessage) *outMessage = @"登录失效，需重新登录";
+        return CAAccountHealthAuthFailed;
+    }
+    if ([trimmed isEqualToString:@"403"] || [trimmed containsString:@"403"]) {
+        if (outMessage) *outMessage = @"权限不足";
+        return CAAccountHealthForbidden;
+    }
+    if ([trimmed isEqualToString:@"429"] || [trimmed containsString:@"429"]) {
+        if (outMessage) *outMessage = @"请求限流";
+        return CAAccountHealthRateLimited;
+    }
+    if ([trimmed isEqualToString:@"RequestFailed"] || [trimmed containsString:@"RequestFailed"]) {
+        if (outMessage) *outMessage = @"网络错误，检查代理";
+        return CAAccountHealthNetworkError;
+    }
+    if (outMessage) *outMessage = nil;
+    return CAAccountHealthOK;
+}
+
+- (CAAccountHealth)worseHealth:(CAAccountHealth)a b:(CAAccountHealth)b {
+    return a > b ? a : b;
+}
+
 - (NSArray<CAAccount *> *)parseAccounts:(NSString *)output error:(NSError **)error {
     NSError *regexError = nil;
     NSRegularExpression *regex = [NSRegularExpression regularExpressionWithPattern:@"^(\\*)?\\s*(\\d+)\\s+(.+?)\\s{2,}(\\S+)\\s{2,}(.+?)\\s{2,}(.+?)\\s{2,}(.+)$"
@@ -288,6 +344,15 @@ static BOOL CAIsNotificationsNotAllowedError(NSError *error) {
         account.usage5h = capture(5);
         account.weeklyUsage = capture(6);
         account.lastActivity = capture(7);
+
+        NSString *msg5h = nil;
+        NSString *msgW = nil;
+        CAAccountHealth h5h = [self healthFromUsageField:account.usage5h message:&msg5h];
+        CAAccountHealth hW = [self healthFromUsageField:account.weeklyUsage message:&msgW];
+        account.health = [self worseHealth:h5h b:hW];
+        account.errorMessage = h5h >= hW ? msg5h : msgW;
+        if (account.health == CAAccountHealthOK) account.errorMessage = nil;
+
         [accounts addObject:account];
     }
 
@@ -335,6 +400,15 @@ static BOOL CAIsNotificationsNotAllowedError(NSError *error) {
 - (NSString *)menuBarUsageTitle {
     for (CAAccount *account in self.accounts) {
         if (account.active) {
+            if (account.health != CAAccountHealthOK && account.health != CAAccountHealthUnknown) {
+                switch (account.health) {
+                    case CAAccountHealthAuthFailed: return @"⚠ 登录失效";
+                    case CAAccountHealthForbidden: return @"⚠ 权限不足";
+                    case CAAccountHealthRateLimited: return @"⚠ 限流";
+                    case CAAccountHealthNetworkError: return @"⚠ 网络错误";
+                    default: break;
+                }
+            }
             NSArray<NSString *> *parts = [account.usage5h componentsSeparatedByString:@" "];
             NSString *usage = parts.count > 0 ? parts[0] : account.usage5h;
             return usage;
@@ -608,6 +682,26 @@ static BOOL CAIsNotificationsNotAllowedError(NSError *error) {
     return [[NSAttributedString alloc] initWithString:text attributes:attributes];
 }
 
+- (NSAttributedString *)errorTagAttributedStringWithMessage:(NSString *)message {
+    NSString *text = [NSString stringWithFormat:@" ⚠ %@ ", message ?: @"错误"];
+    NSDictionary *attributes = @{
+        NSFontAttributeName: [NSFont systemFontOfSize:[NSFont smallSystemFontSize] weight:NSFontWeightMedium],
+        NSForegroundColorAttributeName: [NSColor colorWithCalibratedRed:CAErrorTagFgRed green:CAErrorTagFgGreen blue:CAErrorTagFgBlue alpha:1.0],
+        NSBackgroundColorAttributeName: [NSColor colorWithCalibratedRed:CAErrorTagBgRed green:CAErrorTagBgGreen blue:CAErrorTagBgBlue alpha:1.0]
+    };
+    return [[NSAttributedString alloc] initWithString:text attributes:attributes];
+}
+
+- (NSAttributedString *)dashTagAttributedStringWithLabel:(NSString *)label {
+    NSString *text = [NSString stringWithFormat:@" %@ - ", label];
+    NSDictionary *attributes = @{
+        NSFontAttributeName: [NSFont systemFontOfSize:[NSFont smallSystemFontSize] weight:NSFontWeightMedium],
+        NSForegroundColorAttributeName: [self tagForegroundColorForUsage:NSNotFound],
+        NSBackgroundColorAttributeName: [self tagBackgroundColorForUsage:NSNotFound]
+    };
+    return [[NSAttributedString alloc] initWithString:text attributes:attributes];
+}
+
 - (NSAttributedString *)switchAccountTitleForAccount:(CAAccount *)account {
     NSMutableParagraphStyle *paragraphStyle = [[NSMutableParagraphStyle alloc] init];
     paragraphStyle.tabStops = @[
@@ -628,21 +722,68 @@ static BOOL CAIsNotificationsNotAllowedError(NSError *error) {
     NSMutableAttributedString *result = [[NSMutableAttributedString alloc] initWithString:[NSString stringWithFormat:@"%@\t", account.account]
                                                                                 attributes:leftAttributes];
     [result appendAttributedString:[[NSAttributedString alloc] initWithString:@" " attributes:leftAttributes]];
-    [result appendAttributedString:[self tagAttributedStringWithLabel:@"5H"
-                                                              percent:fiveHourUsage
-                                                                 time:fiveHourTime]];
-    [result appendAttributedString:[[NSAttributedString alloc] initWithString:@"   " attributes:leftAttributes]];
-    [result appendAttributedString:[self tagAttributedStringWithLabel:@"W"
-                                                              percent:weeklyUsage
-                                                                 time:weeklyTime]];
+
+    if (account.health != CAAccountHealthOK) {
+        [result appendAttributedString:[self errorTagAttributedStringWithMessage:account.errorMessage ?: @"异常"]];
+    } else {
+        NSString *trimmed5h = [account.usage5h stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+        NSString *trimmedW = [account.weeklyUsage stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+        BOOL hasDash5h = trimmed5h.length == 0 || [trimmed5h isEqualToString:@"-"];
+        BOOL hasDashW = trimmedW.length == 0 || [trimmedW isEqualToString:@"-"];
+
+        if (hasDash5h) {
+            [result appendAttributedString:[self dashTagAttributedStringWithLabel:@"5H"]];
+        } else {
+            NSInteger fiveHourUsage = [self usagePercentFromString:account.usage5h];
+            NSString *fiveHourTime = [self timeComponentFromUsage:account.usage5h];
+            [result appendAttributedString:[self tagAttributedStringWithLabel:@"5H"
+                                                                  percent:fiveHourUsage
+                                                                     time:fiveHourTime]];
+        }
+        [result appendAttributedString:[[NSAttributedString alloc] initWithString:@"   " attributes:leftAttributes]];
+        if (hasDashW) {
+            [result appendAttributedString:[self dashTagAttributedStringWithLabel:@"W"]];
+        } else {
+            NSInteger weeklyUsage = [self usagePercentFromString:account.weeklyUsage];
+            NSString *weeklyTime = [self dateComponentFromWeeklyUsage:account.weeklyUsage];
+            [result appendAttributedString:[self tagAttributedStringWithLabel:@"W"
+                                                                  percent:weeklyUsage
+                                                                     time:weeklyTime]];
+        }
+    }
     return result;
 }
 
 - (NSString *)currentAccountUsageLineWithLabel:(NSString *)label
                                      usageText:(NSString *)usageText
                                    timeDisplay:(NSString *)timeDisplay {
+    NSString *trimmed = [usageText stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+    if (trimmed.length == 0 || [trimmed isEqualToString:@"-"]) {
+        return [NSString stringWithFormat:@"%@: -", label];
+    }
     NSInteger usedPercent = [self usagePercentFromString:usageText];
+    if (usedPercent == NSNotFound) {
+        return [NSString stringWithFormat:@"%@: %@", label, timeDisplay ?: @""];
+    }
     return [NSString stringWithFormat:@"%@: %ld%% %@", label, (long)usedPercent, timeDisplay];
+}
+
+- (NSAttributedString *)currentAccountErrorLineForAccount:(CAAccount *)account {
+    NSMutableParagraphStyle *paragraphStyle = [[NSMutableParagraphStyle alloc] init];
+    paragraphStyle.tabStops = @[
+        [[NSTextTab alloc] initWithTextAlignment:NSTextAlignmentRight location:230 options:@{}]
+    ];
+    paragraphStyle.defaultTabInterval = 230;
+
+    NSDictionary *leftAttributes = @{
+        NSParagraphStyleAttributeName: paragraphStyle,
+        NSFontAttributeName: [NSFont menuFontOfSize:0]
+    };
+
+    NSMutableAttributedString *result = [[NSMutableAttributedString alloc] initWithString:@"账号状态\t"
+                                                                                attributes:leftAttributes];
+    [result appendAttributedString:[self errorTagAttributedStringWithMessage:account.errorMessage ?: @"异常"]];
+    return result;
 }
 
 - (NSString *)switchAccountMenuTitleForActiveAccount:(CAAccount *)activeAccount {
@@ -904,14 +1045,21 @@ static BOOL CAIsNotificationsNotAllowedError(NSError *error) {
         }
         headerItem.submenu = switchAccountSubmenu;
         [menu addItem:headerItem];
-        [self addStaticItem:[self currentAccountUsageLineWithLabel:@"5H"
-                                                         usageText:active.usage5h
-                                                       timeDisplay:[self timeComponentFromUsage:active.usage5h]]
-                     toMenu:menu];
-        [self addStaticItem:[self currentAccountUsageLineWithLabel:@"W"
-                                                         usageText:active.weeklyUsage
-                                                       timeDisplay:[self dateComponentFromWeeklyUsage:active.weeklyUsage]]
-                     toMenu:menu];
+        if (active.health != CAAccountHealthOK) {
+            NSMenuItem *errorItem = [[NSMenuItem alloc] initWithTitle:@"账号状态" action:nil keyEquivalent:@""];
+            errorItem.enabled = NO;
+            errorItem.attributedTitle = [self currentAccountErrorLineForAccount:active];
+            [menu addItem:errorItem];
+        } else {
+            [self addStaticItem:[self currentAccountUsageLineWithLabel:@"5H"
+                                                             usageText:active.usage5h
+                                                           timeDisplay:[self timeComponentFromUsage:active.usage5h]]
+                         toMenu:menu];
+            [self addStaticItem:[self currentAccountUsageLineWithLabel:@"W"
+                                                             usageText:active.weeklyUsage
+                                                           timeDisplay:[self dateComponentFromWeeklyUsage:active.weeklyUsage]]
+                         toMenu:menu];
+        }
     } else {
         [self addStaticItem:@"Current Account" toMenu:menu];
         [self addStaticItem:(self.refreshing ? @"Refreshing..." : @"No active account") toMenu:menu];
