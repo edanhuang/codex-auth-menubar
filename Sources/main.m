@@ -1656,6 +1656,53 @@ static BOOL CAStringHasAnyPrefix(NSString *value, NSArray<NSString *> *prefixes)
     return CAThirdPartyAPIFormatResponsesValue;
 }
 
+- (BOOL)providerNameRequiresCompatibilityWarning:(NSString *)providerName {
+    NSString *normalized = [CATrimString(providerName) lowercaseString];
+    return [normalized containsString:@"deepseek"] || [normalized containsString:@"kimi"];
+}
+
+- (NSTextField *)thirdPartyCompatibilityDescriptionWithFrame:(NSRect)frame {
+    NSString *text = @"Initial support is for OpenAI Responses API compatible providers.\n"
+                     "DeepSeek / Kimi-style Chat Completions providers require local routing and cannot be enabled yet.";
+    NSMutableAttributedString *attributed = [[NSMutableAttributedString alloc] initWithString:text
+                                                                                   attributes:@{
+                                                                                       NSFontAttributeName: [NSFont systemFontOfSize:13],
+                                                                                       NSForegroundColorAttributeName: [NSColor labelColor]
+                                                                                   }];
+    NSRange emphasizedRange = [text rangeOfString:@"DeepSeek / Kimi"];
+    if (emphasizedRange.location != NSNotFound) {
+        [attributed addAttribute:NSFontAttributeName
+                          value:[NSFont boldSystemFontOfSize:13]
+                          range:emphasizedRange];
+    }
+
+    NSTextField *field = [[NSTextField alloc] initWithFrame:frame];
+    field.editable = NO;
+    field.selectable = NO;
+    field.bezeled = NO;
+    field.drawsBackground = NO;
+    field.attributedStringValue = attributed;
+    field.cell.wraps = YES;
+    field.cell.scrollable = NO;
+    field.cell.lineBreakMode = NSLineBreakByWordWrapping;
+    return field;
+}
+
+- (BOOL)confirmSavingProviderWithoutResponsesSupport:(NSString *)providerName {
+    NSAlert *warning = [[NSAlert alloc] init];
+    warning.messageText = @"Compatibility Warning";
+    warning.informativeText =
+        [NSString stringWithFormat:
+            @"%@ may not provide a Responses API compatible with direct Codex use. "
+             "Saving this provider is allowed, but using it may cause unpredictable behavior, "
+             "including failed API requests or an unusable API configuration.",
+             providerName];
+    [warning addButtonWithTitle:@"Got it"];
+    [warning addButtonWithTitle:@"Cancel"];
+    warning.alertStyle = NSAlertStyleWarning;
+    return [warning runModal] == NSAlertFirstButtonReturn;
+}
+
 - (NSTextField *)labelWithString:(NSString *)label frame:(NSRect)frame {
     NSTextField *field = [[NSTextField alloc] initWithFrame:frame];
     field.stringValue = label ?: @"";
@@ -1732,13 +1779,14 @@ static BOOL CAStringHasAnyPrefix(NSString *value, NSArray<NSString *> *prefixes)
 - (void)showThirdPartyAccountFormForAccount:(CAThirdPartyAccount *)existingAccount {
     NSAlert *alert = [[NSAlert alloc] init];
     alert.messageText = existingAccount ? @"Edit Third Party Account" : @"Add Third Party Account";
-    alert.informativeText = @"Initial support is for OpenAI Responses API compatible providers. DeepSeek/Kimi-style Chat Completions providers require local routing and cannot be enabled yet.";
     [alert addButtonWithTitle:@"Save"];
     [alert addButtonWithTitle:@"Cancel"];
     if (existingAccount) [alert addButtonWithTitle:@"Delete"];
     alert.alertStyle = NSAlertStyleInformational;
 
-    NSView *view = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 480, 282)];
+    NSView *view = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 480, 350)];
+    [view addSubview:[self thirdPartyCompatibilityDescriptionWithFrame:NSMakeRect(0, 294, 480, 50)]];
+
     CGFloat labelX = 0;
     CGFloat fieldX = 150;
     CGFloat width = 320;
@@ -1804,6 +1852,7 @@ static BOOL CAStringHasAnyPrefix(NSString *value, NSArray<NSString *> *prefixes)
     [view addSubview:hint];
 
     alert.accessoryView = view;
+    NSString *acknowledgedProviderName = nil;
 
     while (YES) {
         NSModalResponse response = [alert runModal];
@@ -1847,6 +1896,15 @@ static BOOL CAStringHasAnyPrefix(NSString *value, NSArray<NSString *> *prefixes)
             [self showAlertWithTitle:@"Missing Required Fields"
                              message:[NSString stringWithFormat:@"Please fill: %@", [missing componentsJoinedByString:@", "]]];
             continue;
+        }
+
+        NSString *normalizedProviderName = [providerName lowercaseString];
+        if ([self providerNameRequiresCompatibilityWarning:providerName] &&
+            ![acknowledgedProviderName isEqualToString:normalizedProviderName]) {
+            if (![self confirmSavingProviderWithoutResponsesSupport:providerName]) {
+                continue;
+            }
+            acknowledgedProviderName = normalizedProviderName;
         }
 
         CAThirdPartyAccount *account = existingAccount
