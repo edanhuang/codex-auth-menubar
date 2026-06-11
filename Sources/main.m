@@ -2122,30 +2122,48 @@ static BOOL CAStringHasAnyPrefix(NSString *value, NSArray<NSString *> *prefixes)
 }
 
 - (NSString *)dateComponentFromWeeklyUsage:(NSString *)usageText {
-    NSRegularExpression *regex = [NSRegularExpression regularExpressionWithPattern:@"on\\s+(\\d{1,2}\\s+[A-Za-z]{3})"
-                                                                           options:NSRegularExpressionCaseInsensitive
-                                                                             error:nil];
-    NSTextCheckingResult *match = [regex firstMatchInString:usageText options:0 range:NSMakeRange(0, usageText.length)];
-    if (!match || [match numberOfRanges] < 2) return @"--月--日";
-
-    NSString *englishDate = [usageText substringWithRange:[match rangeAtIndex:1]];
-    NSDateFormatter *parser = [[NSDateFormatter alloc] init];
-    parser.locale = [[NSLocale alloc] initWithLocaleIdentifier:@"en_US_POSIX"];
-    parser.dateFormat = @"d MMM";
-
-    NSDate *date = [parser dateFromString:englishDate];
-    if (!date) return @"--月--日";
-
-    NSString *languageCode = [[[NSLocale preferredLanguages] firstObject] lowercaseString];
-    if ([languageCode hasPrefix:@"zh"]) {
-        NSDateComponents *components = [[NSCalendar currentCalendar] components:(NSCalendarUnitMonth | NSCalendarUnitDay) fromDate:date];
-        return [NSString stringWithFormat:@"%ld月%ld日", (long)components.month, (long)components.day];
+    // 1. 尝试日期格式: "on d MMM"（非当天刷新）
+    NSRegularExpression *dateRegex = [NSRegularExpression regularExpressionWithPattern:@"on\\s+(\\d{1,2}\\s+[A-Za-z]{3})"
+                                                                               options:NSRegularExpressionCaseInsensitive
+                                                                                 error:nil];
+    NSTextCheckingResult *dateMatch = [dateRegex firstMatchInString:usageText options:0 range:NSMakeRange(0, usageText.length)];
+    if (dateMatch && [dateMatch numberOfRanges] >= 2) {
+        NSString *englishDate = [usageText substringWithRange:[dateMatch rangeAtIndex:1]];
+        NSDateFormatter *parser = [[NSDateFormatter alloc] init];
+        parser.locale = [[NSLocale alloc] initWithLocaleIdentifier:@"en_US_POSIX"];
+        parser.dateFormat = @"d MMM";
+        NSDate *date = [parser dateFromString:englishDate];
+        if (date) {
+            NSString *languageCode = [[[NSLocale preferredLanguages] firstObject] lowercaseString];
+            if ([languageCode hasPrefix:@"zh"]) {
+                NSDateComponents *components = [[NSCalendar currentCalendar] components:(NSCalendarUnitMonth | NSCalendarUnitDay) fromDate:date];
+                return [NSString stringWithFormat:@"%ld月%ld日", (long)components.month, (long)components.day];
+            }
+            NSDateFormatter *formatter = [[NSDateFormatter alloc] init];
+            formatter.locale = [[NSLocale alloc] initWithLocaleIdentifier:@"en_US_POSIX"];
+            formatter.dateFormat = @"dd MMM";
+            return [formatter stringFromDate:date];
+        }
     }
 
-    NSDateFormatter *formatter = [[NSDateFormatter alloc] init];
-    formatter.locale = [[NSLocale alloc] initWithLocaleIdentifier:@"en_US_POSIX"];
-    formatter.dateFormat = @"dd MMM";
-    return [formatter stringFromDate:date];
+    // 2. 降级: 当天刷新时展示的是时间，提取括号内时钟格式 HH:MM
+    NSRegularExpression *timeRegex = [NSRegularExpression regularExpressionWithPattern:@"\\(([^\\)]+)\\)"
+                                                                               options:0
+                                                                                 error:nil];
+    NSTextCheckingResult *timeMatch = [timeRegex firstMatchInString:usageText options:0 range:NSMakeRange(0, usageText.length)];
+    if (timeMatch && [timeMatch numberOfRanges] >= 2) {
+        NSString *inside = [usageText substringWithRange:[timeMatch rangeAtIndex:1]];
+        NSString *trimmed = [inside stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        NSRegularExpression *clockRegex = [NSRegularExpression regularExpressionWithPattern:@"\\b\\d{1,2}:\\d{2}\\b"
+                                                                                    options:0
+                                                                                      error:nil];
+        NSTextCheckingResult *clockMatch = [clockRegex firstMatchInString:trimmed options:0 range:NSMakeRange(0, trimmed.length)];
+        if (clockMatch) {
+            return [trimmed substringWithRange:clockMatch.range];
+        }
+    }
+
+    return @"--:--";
 }
 
 - (NSString *)usageSummaryForAccount:(CAAccount *)account {
