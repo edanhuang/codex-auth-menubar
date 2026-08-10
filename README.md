@@ -140,7 +140,7 @@ Switching to a Third Party account updates the user-level Codex files:
 ~/.codex/auth.json
 ```
 
-The app writes a unique `model_provider`, `model`, and `[model_providers.<id>]` block for the selected provider. It also temporarily writes an API-key `auth.json` containing `OPENAI_API_KEY`, so Codex identifies the session as API Key mode instead of continuing to display the ChatGPT account.
+All Third Party accounts use the fixed Codex provider ID `custom`. Switching accounts updates that shared route and keeps Codex conversation history in one provider group. The app temporarily writes an API-key `auth.json` containing `OPENAI_API_KEY`, so Codex identifies the session as API Key mode instead of continuing to display the ChatGPT account.
 
 Before the first Third Party switch, the existing official `auth.json` is backed up under:
 
@@ -148,7 +148,7 @@ Before the first Third Party switch, the existing official `auth.json` is backed
 ~/Library/Application Support/CodexAuthMenu/official-auth.json.backup
 ```
 
-Switching back to a Codex account restores that exact official `auth.json`. Provider-related `config.toml` fields are restored separately, leaving unrelated Codex config such as MCP, sandbox, permissions, and profiles intact.
+Switching back to a Codex account restores that exact official `auth.json` and the original `custom` provider configuration. Provider-related `config.toml` fields are restored separately, leaving unrelated Codex config such as MCP, sandbox, permissions, and profiles intact.
 
 Existing Codex sessions may have already loaded the old config. Restart Codex sessions after switching providers.
 
@@ -157,7 +157,11 @@ Existing Codex sessions may have already loaded the old config. Restart Codex se
 - `Base URL`: a provider root such as `https://api.example.com/v1`. Codex will use it as the Responses API base.
 - `Full URL`: a complete Responses endpoint. For direct Codex use, it must end with `/responses` or `/v1/responses`; the app derives the base URL before writing `config.toml`.
 
-The first Third Party release only supports providers compatible with the OpenAI Responses API. Chat Completions-only providers such as DeepSeek/Kimi-style `/chat/completions` endpoints can be saved for later, but enabling them is blocked until local routing and protocol conversion are implemented.
+Third Party accounts must ultimately expose an OpenAI Responses API endpoint. For DeepSeek, save the normal DeepSeek upstream details instead: `Base URL` `https://api.deepseek.com/v1` and model `deepseek-v4-flash`. CodexAuthMenu automatically starts Moon Bridge and writes the local `http://127.0.0.1:38440/v1` + `moonbridge` route into Codex; direct DeepSeek Chat Completions endpoints are never written into Codex.
+
+On the first switch to a DeepSeek account, CodexAuthMenu automatically clones Moon Bridge from `https://github.com/ZhiYi-R/moon-bridge.git` into `~/Library/Application Support/CodexAuthMenu/moon-bridge`, builds it, creates a private runtime configuration using that account's Keychain API key, starts it, and waits for its local `/v1/models` health endpoint. Git and Go must already be installed and available from your login shell. The generated configuration and manager state are private (`0600`); the configuration is removed when the app stops its managed bridge.
+
+When switching away from DeepSeek or quitting CodexAuthMenu, the app stops only the Moon Bridge process it started. If the configured loopback endpoint already has a healthy Moon Bridge not owned by this app, it is reused but never changed or stopped.
 
 ## Known Issues
 

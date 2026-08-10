@@ -5,6 +5,9 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <signal.h>
+#include <unistd.h>
+#include <errno.h>
 
 static NSString *const CAErrorDomain = @"CodexAuthMenu";
 static NSString *const CADefaultPollIntervalKey = @"pollIntervalSeconds";
@@ -25,6 +28,7 @@ static NSString *const CAAppSupportFolderName = @"CodexAuthMenu";
 static NSString *const CAThirdPartyAccountsFileName = @"third-party-accounts.json";
 static NSString *const CAOfficialAuthBackupFileName = @"official-auth.json.backup";
 static NSString *const CACodexProviderIDPrefix = @"codex_auth_menu_";
+static NSString *const CACodexSharedProviderID = @"custom";
 static const NSTimeInterval CADefaultPollInterval = 300.0;
 static const CGFloat CAMenuBarIconSize = 18.0;
 static const CGFloat CASwitchAccountTabLocation = 320.0;
@@ -112,6 +116,24 @@ static NSString *CATOMLEscapedString(NSString *value) {
     return escaped ?: @"";
 }
 
+// Codex speaks the Responses API. DeepSeek's documented Codex integration
+// places Moon Bridge (or an equivalent local router) between Codex and
+// DeepSeek, so endpoint capability must take precedence over the provider name.
+static BOOL CAEndpointIsLocalResponsesProxy(NSString *endpointURL) {
+    NSURLComponents *components = [NSURLComponents componentsWithString:CATrimString(endpointURL)];
+    NSString *host = [components.host lowercaseString];
+    BOOL isLoopbackHost = [host isEqualToString:@"localhost"] ||
+                          [host isEqualToString:@"127.0.0.1"] ||
+                          [host isEqualToString:@"::1"];
+    if (!isLoopbackHost) return NO;
+
+    NSString *path = [(components.path ?: @"") lowercaseString];
+    while ([path hasSuffix:@"/"]) {
+        path = [path substringToIndex:path.length - 1];
+    }
+    return [path isEqualToString:@"/v1"] || [path isEqualToString:@"/v1/responses"];
+}
+
 static BOOL CAStringHasAnyPrefix(NSString *value, NSArray<NSString *> *prefixes) {
     for (NSString *prefix in prefixes) {
         if ([value hasPrefix:prefix]) return YES;
@@ -170,6 +192,8 @@ static BOOL CAStringHasAnyPrefix(NSString *value, NSArray<NSString *> *prefixes)
 + (instancetype)accountFromDictionary:(NSDictionary *)dictionary;
 - (NSDictionary *)dictionaryRepresentation;
 - (BOOL)isChatCompletionsOnly;
+- (BOOL)isResponsesAPICompatible;
+- (BOOL)isDeepSeekProvider;
 @end
 
 @interface CAEditableTextField : NSTextField <NSTextFieldDelegate>
@@ -334,7 +358,108 @@ static BOOL CAStringHasAnyPrefix(NSString *value, NSArray<NSString *> *prefixes)
     return [self.apiFormat isEqualToString:CAThirdPartyAPIFormatChatValue];
 }
 
+- (BOOL)isResponsesAPICompatible {
+    return ![self isChatCompletionsOnly] || CAEndpointIsLocalResponsesProxy(self.endpointURL);
+}
+
+- (BOOL)isDeepSeekProvider {
+    NSString *identity = [[NSString stringWithFormat:@"%@ %@", self.providerName ?: @"", self.websiteURL ?: @""] lowercaseString];
+    return [identity containsString:@"deepseek"];
+}
+
 @end
+
+static NSString *CAYAMLEscapedString(NSString *value) {
+    NSString *escaped = [value stringByReplacingOccurrencesOfString:@"\\" withString:@"\\\\"];
+    escaped = [escaped stringByReplacingOccurrencesOfString:@"\"" withString:@"\\\""];
+    escaped = [escaped stringByReplacingOccurrencesOfString:@"\n" withString:@" "];
+    escaped = [escaped stringByReplacingOccurrencesOfString:@"\r" withString:@" "];
+    return escaped ?: @"";
+}
+
+static NSString *CAMoonBridgeListenAddressForAccount(CAThirdPartyAccount *account, NSError **error) {
+    NSURLComponents *components = [NSURLComponents componentsWithString:CATrimString(account.endpointURL)];
+    NSString *host = [components.host lowercaseString];
+    BOOL isLoopbackHost = [host isEqualToString:@"localhost"] ||
+                          [host isEqualToString:@"127.0.0.1"] ||
+                          [host isEqualToString:@"::1"];
+    NSString *path = [(components.path ?: @"") lowercaseString];
+    while ([path hasSuffix:@"/"]) path = [path substringToIndex:path.length - 1];
+    NSInteger port = components.port.integerValue;
+    if (!isLoopbackHost ||
+        !([path isEqualToString:@"/v1"] || [path isEqualToString:@"/v1/responses"]) ||
+        port < 1 || port > 65535) {
+        return @"127.0.0.1:38440";
+    }
+    NSString *addressHost = [host isEqualToString:@"::1"] ? @"[::1]" : host;
+    return [NSString stringWithFormat:@"%@:%ld", addressHost, (long)port];
+}
+
+static CAThirdPartyAccount *CAMoonBridgeCodexAccount(CAThirdPartyAccount *account) {
+    CAThirdPartyAccount *routedAccount = [CAThirdPartyAccount accountFromDictionary:[account dictionaryRepresentation]];
+    if (!routedAccount) return nil;
+    NSString *address = CAMoonBridgeListenAddressForAccount(account, nil);
+    routedAccount.endpointURL = [NSString stringWithFormat:@"http://%@/v1", address];
+    routedAccount.endpointType = CAThirdPartyEndpointBaseURLValue;
+    routedAccount.modelName = @"moonbridge";
+    routedAccount.apiFormat = CAThirdPartyAPIFormatResponsesValue;
+    return routedAccount;
+}
+
+static NSString *CAMoonBridgeConfigurationForAccount(CAThirdPartyAccount *account, NSString *apiKey, NSError **error) {
+    if (![account isDeepSeekProvider]) {
+        if (error) {
+            *error = [NSError errorWithDomain:CAErrorDomain
+                                         code:48
+                                     userInfo:@{NSLocalizedDescriptionKey: @"Moon Bridge is only managed for DeepSeek accounts."}];
+        }
+        return nil;
+    }
+    if (apiKey.length == 0) {
+        if (error) {
+            *error = [NSError errorWithDomain:CAErrorDomain
+                                         code:49
+                                     userInfo:@{NSLocalizedDescriptionKey: @"DeepSeek API Key is required to start Moon Bridge."}];
+        }
+        return nil;
+    }
+    NSString *address = CAMoonBridgeListenAddressForAccount(account, error);
+    if (!address) return nil;
+
+    return [NSString stringWithFormat:
+            @"mode: \"Transform\"\n\n"
+             "server:\n"
+             "  addr: \"%@\"\n\n"
+             "models:\n"
+             "  deepseek-v4-flash:\n"
+             "    context_window: 1000000\n"
+             "    max_output_tokens: 384000\n"
+             "    default_reasoning_level: \"high\"\n"
+             "    supported_reasoning_levels:\n"
+             "      - effort: \"high\"\n"
+             "        description: \"High reasoning effort\"\n"
+             "      - effort: \"xhigh\"\n"
+             "        description: \"Extra high reasoning effort\"\n"
+             "    supports_reasoning_summaries: true\n"
+             "    default_reasoning_summary: \"auto\"\n"
+             "    extensions:\n"
+             "      deepseek_v4:\n"
+             "        enabled: true\n\n"
+             "providers:\n"
+             "  deepseek:\n"
+             "    base_url: \"https://api.deepseek.com/anthropic\"\n"
+             "    api_key: \"%@\"\n"
+             "    offers:\n"
+             "      - model: deepseek-v4-flash\n\n"
+             "routes:\n"
+             "  moonbridge:\n"
+             "    model: deepseek-v4-flash\n"
+             "    provider: deepseek\n\n"
+             "defaults:\n"
+             "  model: moonbridge\n"
+             "  max_tokens: 65536\n",
+            CAYAMLEscapedString(address), CAYAMLEscapedString(apiKey)];
+}
 
 @interface CAThirdPartyAccountStore : NSObject
 + (NSString *)applicationSupportDirectory;
@@ -676,6 +801,25 @@ static BOOL CAStringHasAnyPrefix(NSString *value, NSArray<NSString *> *prefixes)
     return nil;
 }
 
++ (NSDictionary *)providerSectionSnapshotForProviderID:(NSString *)providerID inText:(NSString *)text {
+    NSString *header = [NSString stringWithFormat:@"[model_providers.%@]", providerID ?: @""];
+    NSArray<NSString *> *lines = [text componentsSeparatedByCharactersInSet:[NSCharacterSet newlineCharacterSet]];
+    NSMutableArray<NSString *> *sectionLines = [NSMutableArray array];
+    BOOL capturing = NO;
+    for (NSString *line in lines) {
+        NSString *trimmed = CATrimString(line);
+        if ([trimmed hasPrefix:@"["]) {
+            if (capturing) break;
+            if ([trimmed isEqualToString:header]) capturing = YES;
+        }
+        if (capturing) [sectionLines addObject:line];
+    }
+    return @{
+        @"present": @(capturing),
+        @"text": [sectionLines componentsJoinedByString:@"\n"]
+    };
+}
+
 + (NSDictionary *)snapshotFromConfigText:(NSString *)text {
     NSArray<NSString *> *keys = @[@"model_provider", @"model", @"model_reasoning_effort", @"disable_response_storage"];
     NSMutableDictionary *topLevel = [NSMutableDictionary dictionary];
@@ -688,6 +832,9 @@ static BOOL CAStringHasAnyPrefix(NSString *value, NSArray<NSString *> *prefixes)
     }
     return @{
         @"topLevel": topLevel,
+        @"providerSections": @{
+            @"custom": [self providerSectionSnapshotForProviderID:@"custom" inText:text]
+        },
         @"createdAt": @([[NSDate date] timeIntervalSince1970])
     };
 }
@@ -779,12 +926,12 @@ static BOOL CAStringHasAnyPrefix(NSString *value, NSArray<NSString *> *prefixes)
                                             apiKey:(NSString *)apiKey
                                             toText:(NSString *)text
                                              error:(NSError **)error {
-    if ([account isChatCompletionsOnly]) {
+    if (![account isResponsesAPICompatible]) {
         if (error) {
             *error = [NSError errorWithDomain:CAErrorDomain
                                          code:42
                                      userInfo:@{NSLocalizedDescriptionKey:
-                                                    @"This provider uses Chat Completions. Local routing is required and is not supported yet."}];
+                                                    @"This provider uses Chat Completions. Configure a local Responses API router before enabling it."}];
         }
         return nil;
     }
@@ -802,7 +949,7 @@ static BOOL CAStringHasAnyPrefix(NSString *value, NSArray<NSString *> *prefixes)
 
     NSArray<NSString *> *topKeys = @[@"model_provider", @"model", @"model_reasoning_effort", @"disable_response_storage"];
     NSString *cleaned = [self textByRemovingTopLevelKeys:topKeys fromText:text ?: @""];
-    cleaned = [self textByRemovingProviderSections:@[account.codexProviderID] fromText:cleaned];
+    cleaned = [self textByRemovingProviderSections:@[account.codexProviderID, @"custom"] fromText:cleaned];
     NSString *trimmedCleaned = [cleaned stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
 
     NSString *topBlock = [NSString stringWithFormat:
@@ -810,7 +957,7 @@ static BOOL CAStringHasAnyPrefix(NSString *value, NSArray<NSString *> *prefixes)
                           "model = \"%@\"\n"
                           "model_reasoning_effort = \"high\"\n"
                           "disable_response_storage = true",
-                          CATOMLEscapedString(account.codexProviderID),
+                          CACodexSharedProviderID,
                           CATOMLEscapedString(account.modelName)];
     NSString *providerBlock = [NSString stringWithFormat:
                                @"[model_providers.%@]\n"
@@ -818,7 +965,7 @@ static BOOL CAStringHasAnyPrefix(NSString *value, NSArray<NSString *> *prefixes)
                                "base_url = \"%@\"\n"
                                "wire_api = \"responses\"\n"
                                "requires_openai_auth = true",
-                               account.codexProviderID,
+                               CACodexSharedProviderID,
                                CATOMLEscapedString(account.providerName),
                                CATOMLEscapedString(baseURL)];
 
@@ -835,7 +982,9 @@ static BOOL CAStringHasAnyPrefix(NSString *value, NSArray<NSString *> *prefixes)
                                    fromText:(NSString *)text {
     NSArray<NSString *> *topKeys = @[@"model_provider", @"model", @"model_reasoning_effort", @"disable_response_storage"];
     NSString *cleaned = [self textByRemovingTopLevelKeys:topKeys fromText:text ?: @""];
-    cleaned = [self textByRemovingProviderSections:providerIDs fromText:cleaned];
+    NSMutableArray<NSString *> *managedProviderIDs = [providerIDs mutableCopy] ?: [NSMutableArray array];
+    if (![managedProviderIDs containsObject:@"custom"]) [managedProviderIDs addObject:@"custom"];
+    cleaned = [self textByRemovingProviderSections:managedProviderIDs fromText:cleaned];
     NSString *trimmedCleaned = [cleaned stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
 
     NSDictionary *topLevel = [snapshot[@"topLevel"] isKindOfClass:[NSDictionary class]] ? snapshot[@"topLevel"] : @{};
@@ -857,8 +1006,355 @@ static BOOL CAStringHasAnyPrefix(NSString *value, NSArray<NSString *> *prefixes)
         if (result.length > 0) [result appendString:@"\n\n"];
         [result appendString:trimmedCleaned];
     }
+    NSDictionary *providerSections = [snapshot[@"providerSections"] isKindOfClass:[NSDictionary class]] ? snapshot[@"providerSections"] : @{};
+    NSDictionary *customSection = [providerSections[@"custom"] isKindOfClass:[NSDictionary class]] ? providerSections[@"custom"] : nil;
+    NSString *customText = CAJSONStringValue(customSection[@"text"]);
+    if ([customSection[@"present"] boolValue] && customText.length > 0) {
+        if (result.length > 0) [result appendString:@"\n\n"];
+        [result appendString:customText];
+    }
     if (result.length > 0 && ![result hasSuffix:@"\n"]) [result appendString:@"\n"];
     return result;
+}
+
+@end
+
+static NSString *CACommandOutput(NSString *launchPath, NSArray<NSString *> *arguments, NSString *currentDirectory, NSError **error) {
+    NSTask *task = [[NSTask alloc] init];
+    task.launchPath = launchPath;
+    task.arguments = arguments ?: @[];
+    if (currentDirectory.length > 0) task.currentDirectoryPath = currentDirectory;
+    NSString *logPath = [NSTemporaryDirectory() stringByAppendingPathComponent:
+                         [NSString stringWithFormat:@"CodexAuthMenu-command-%@.log", NSUUID.UUID.UUIDString]];
+    if (![[NSFileManager defaultManager] createFileAtPath:logPath contents:nil attributes:@{NSFilePosixPermissions: @0600}]) {
+        if (error) {
+            *error = [NSError errorWithDomain:CAErrorDomain
+                                         code:50
+                                     userInfo:@{NSLocalizedDescriptionKey: @"Failed to create a private command log."}];
+        }
+        return nil;
+    }
+    NSFileHandle *logHandle = [NSFileHandle fileHandleForWritingAtPath:logPath];
+    task.standardOutput = logHandle;
+    task.standardError = logHandle;
+    @try {
+        [task launch];
+        [task waitUntilExit];
+    } @catch (NSException *exception) {
+        [logHandle closeFile];
+        [[NSFileManager defaultManager] removeItemAtPath:logPath error:nil];
+        if (error) {
+            *error = [NSError errorWithDomain:CAErrorDomain
+                                         code:50
+                                     userInfo:@{NSLocalizedDescriptionKey: exception.reason ?: @"Failed to start a required command."}];
+        }
+        return nil;
+    }
+
+    [logHandle closeFile];
+    NSData *outputData = [NSData dataWithContentsOfFile:logPath] ?: [NSData data];
+    [[NSFileManager defaultManager] removeItemAtPath:logPath error:nil];
+    NSString *output = [[NSString alloc] initWithData:outputData encoding:NSUTF8StringEncoding] ?: @"";
+    if (task.terminationStatus != 0) {
+        if (error) {
+            NSString *detail = [output stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+            if (detail.length > 500) detail = [detail substringFromIndex:detail.length - 500];
+            *error = [NSError errorWithDomain:CAErrorDomain
+                                         code:51
+                                     userInfo:@{NSLocalizedDescriptionKey:
+                                                    detail.length > 0 ? detail : [NSString stringWithFormat:@"Command failed: %@", launchPath]}];
+        }
+        return nil;
+    }
+    return output;
+}
+
+static NSString *CAResolveExecutable(NSString *command) {
+    NSError *error = nil;
+    NSString *output = CACommandOutput(@"/bin/zsh", @[ @"-l", @"-c", [NSString stringWithFormat:@"command -v %@", command] ], nil, &error);
+    NSString *path = [output stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    BOOL isDirectory = NO;
+    if (path.length == 0 || ![[NSFileManager defaultManager] fileExistsAtPath:path isDirectory:&isDirectory] || isDirectory) return nil;
+    return [[path stringByStandardizingPath] stringByResolvingSymlinksInPath];
+}
+
+static NSString *CANVMExecutablePathForCommand(NSString *command) {
+    NSString *versionsDirectory = [[NSHomeDirectory() stringByAppendingPathComponent:@".nvm"] stringByAppendingPathComponent:@"versions/node"];
+    NSArray<NSString *> *versions = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:versionsDirectory error:nil];
+    NSArray<NSString *> *orderedVersions = [versions sortedArrayUsingComparator:^NSComparisonResult(NSString *left, NSString *right) {
+        return [right compare:left options:NSNumericSearch range:NSMakeRange(0, right.length) locale:[NSLocale currentLocale]];
+    }];
+    for (NSString *version in orderedVersions) {
+        NSString *candidate = [[[versionsDirectory stringByAppendingPathComponent:version] stringByAppendingPathComponent:@"bin"] stringByAppendingPathComponent:command];
+        if ([[NSFileManager defaultManager] isExecutableFileAtPath:candidate]) {
+            return [[candidate stringByStandardizingPath] stringByResolvingSymlinksInPath];
+        }
+    }
+    return nil;
+}
+
+static BOOL CAWritePrivateData(NSData *data, NSString *path, NSError **error) {
+    NSString *directory = [path stringByDeletingLastPathComponent];
+    if (![[NSFileManager defaultManager] createDirectoryAtPath:directory
+                                   withIntermediateDirectories:YES
+                                                    attributes:@{NSFilePosixPermissions: @0700}
+                                                         error:error]) {
+        return NO;
+    }
+    chmod(directory.fileSystemRepresentation, 0700);
+    if (![data writeToFile:path options:NSDataWritingAtomic error:error]) return NO;
+    chmod(path.fileSystemRepresentation, 0600);
+    return YES;
+}
+
+static NSString *CACommandLineForPID(pid_t pid) {
+    NSError *error = nil;
+    NSString *output = CACommandOutput(@"/bin/ps", @[ @"-p", [NSString stringWithFormat:@"%d", pid], @"-o", @"command=" ], nil, &error);
+    return [output stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+}
+
+static BOOL CAWaitForProcessExit(pid_t pid, NSTimeInterval timeout) {
+    NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:timeout];
+    while ([[NSDate date] compare:deadline] == NSOrderedAscending) {
+        if (kill(pid, 0) != 0 && errno == ESRCH) return YES;
+        usleep(100000);
+    }
+    return kill(pid, 0) != 0 && errno == ESRCH;
+}
+
+static BOOL CAStopOwnedProcess(pid_t pid, NSString *expectedExecutablePath, NSError **error) {
+    if (pid <= 0) return YES;
+    if (kill(pid, 0) != 0 && errno == ESRCH) return YES;
+    NSString *commandLine = CACommandLineForPID(pid);
+    NSString *canonicalPath = [[expectedExecutablePath stringByStandardizingPath] stringByResolvingSymlinksInPath];
+    if (commandLine.length == 0 || ![commandLine containsString:canonicalPath]) {
+        if (error) {
+            *error = [NSError errorWithDomain:CAErrorDomain
+                                         code:52
+                                     userInfo:@{NSLocalizedDescriptionKey: @"The recorded Moon Bridge PID no longer belongs to the managed executable; it was not stopped."}];
+        }
+        return NO;
+    }
+    if (kill(pid, SIGTERM) != 0 && errno != ESRCH) {
+        if (error) {
+            *error = [NSError errorWithDomain:CAErrorDomain
+                                         code:53
+                                     userInfo:@{NSLocalizedDescriptionKey: [NSString stringWithFormat:@"Failed to stop Moon Bridge (%d).", errno]}];
+        }
+        return NO;
+    }
+    if (CAWaitForProcessExit(pid, 3.0)) return YES;
+    if (kill(pid, SIGKILL) != 0 && errno != ESRCH) {
+        if (error) {
+            *error = [NSError errorWithDomain:CAErrorDomain
+                                         code:54
+                                     userInfo:@{NSLocalizedDescriptionKey: [NSString stringWithFormat:@"Moon Bridge did not stop after SIGTERM (%d).", errno]}];
+        }
+        return NO;
+    }
+    if (CAWaitForProcessExit(pid, 2.0)) return YES;
+    if (error) {
+        *error = [NSError errorWithDomain:CAErrorDomain
+                                     code:55
+                                 userInfo:@{NSLocalizedDescriptionKey: @"Moon Bridge did not exit after termination."}];
+    }
+    return NO;
+}
+
+@interface CAMoonBridgeManager : NSObject
+@property(nonatomic, assign, readonly) BOOL externallyOwned;
+@property(nonatomic, assign, readonly) BOOL startedManagedBridgeDuringLastEnsure;
+- (BOOL)ensureRunningForAccount:(CAThirdPartyAccount *)account apiKey:(NSString *)apiKey error:(NSError **)error;
+- (BOOL)stopManagedBridgeIfOwned:(NSError **)error;
+@end
+
+@implementation CAMoonBridgeManager
+
+- (NSString *)installationDirectory {
+    return [[CAThirdPartyAccountStore applicationSupportDirectory] stringByAppendingPathComponent:@"moon-bridge"];
+}
+
+- (NSString *)binaryPath {
+    return [[self installationDirectory] stringByAppendingPathComponent:@"moonbridge"];
+}
+
+- (NSString *)configurationPath {
+    return [[self installationDirectory] stringByAppendingPathComponent:@"config.yml"];
+}
+
+- (NSString *)statePath {
+    return [[self installationDirectory] stringByAppendingPathComponent:@"managed-process.json"];
+}
+
+- (NSDictionary *)managedState {
+    NSData *data = [NSData dataWithContentsOfFile:[self statePath]];
+    if (data.length == 0) return nil;
+    id object = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+    return [object isKindOfClass:[NSDictionary class]] ? object : nil;
+}
+
+- (void)removeManagedArtifacts {
+    [[NSFileManager defaultManager] removeItemAtPath:[self statePath] error:nil];
+    [[NSFileManager defaultManager] removeItemAtPath:[self configurationPath] error:nil];
+}
+
+- (BOOL)isRecordedStateLive:(NSDictionary *)state {
+    NSNumber *pidValue = state[@"pid"];
+    NSString *binary = CAJSONStringValue(state[@"binaryPath"]);
+    pid_t pid = pidValue.intValue;
+    if (pid <= 0 || binary.length == 0 || (kill(pid, 0) != 0 && errno == ESRCH)) return NO;
+    NSString *commandLine = CACommandLineForPID(pid);
+    NSString *canonicalBinary = [[binary stringByStandardizingPath] stringByResolvingSymlinksInPath];
+    return commandLine.length > 0 && [commandLine containsString:canonicalBinary];
+}
+
+- (NSString *)healthURLForAccount:(CAThirdPartyAccount *)account {
+    if ([account isDeepSeekProvider]) {
+        return [NSString stringWithFormat:@"http://%@/v1/models", CAMoonBridgeListenAddressForAccount(account, nil)];
+    }
+    NSString *endpoint = [CATrimString(account.endpointURL) stringByTrimmingCharactersInSet:[NSCharacterSet characterSetWithCharactersInString:@"/"]];
+    if ([[endpoint lowercaseString] hasSuffix:@"/responses"]) {
+        endpoint = [endpoint substringToIndex:endpoint.length - @"/responses".length];
+    }
+    return [endpoint stringByAppendingString:@"/models"];
+}
+
+- (BOOL)isHealthyForAccount:(CAThirdPartyAccount *)account {
+    NSURL *url = [NSURL URLWithString:[self healthURLForAccount:account]];
+    if (!url) return NO;
+    NSURLRequest *request = [NSURLRequest requestWithURL:url cachePolicy:NSURLRequestReloadIgnoringLocalCacheData timeoutInterval:1.0];
+    dispatch_semaphore_t semaphore = dispatch_semaphore_create(0);
+    __block NSInteger statusCode = 0;
+    NSURLSessionDataTask *task = [[NSURLSession sharedSession] dataTaskWithRequest:request completionHandler:^(NSData *data, NSURLResponse *response, NSError *requestError) {
+        if (!requestError && [response isKindOfClass:[NSHTTPURLResponse class]]) {
+            statusCode = ((NSHTTPURLResponse *)response).statusCode;
+        }
+        dispatch_semaphore_signal(semaphore);
+    }];
+    [task resume];
+    long waitResult = dispatch_semaphore_wait(semaphore, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1500 * NSEC_PER_MSEC)));
+    if (waitResult != 0) [task cancel];
+    return statusCode >= 200 && statusCode < 300;
+}
+
+- (BOOL)waitUntilHealthyForAccount:(CAThirdPartyAccount *)account task:(NSTask *)task error:(NSError **)error {
+    NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:12.0];
+    while ([[NSDate date] compare:deadline] == NSOrderedAscending) {
+        if (!task.isRunning) break;
+        if ([self isHealthyForAccount:account]) return YES;
+        usleep(200000);
+    }
+    if (error) {
+        *error = [NSError errorWithDomain:CAErrorDomain
+                                     code:56
+                                 userInfo:@{NSLocalizedDescriptionKey: @"Moon Bridge did not become healthy at the configured local /v1 endpoint."}];
+    }
+    return NO;
+}
+
+- (BOOL)ensureInstalled:(NSError **)error {
+    NSString *binary = [self binaryPath];
+    if ([[NSFileManager defaultManager] isExecutableFileAtPath:binary]) return YES;
+    NSString *gitPath = CAResolveExecutable(@"git");
+    NSString *goPath = CAResolveExecutable(@"go");
+    if (gitPath.length == 0 || goPath.length == 0) {
+        if (error) {
+            NSString *missing = gitPath.length == 0 ? (goPath.length == 0 ? @"Git and Go" : @"Git") : @"Go";
+            *error = [NSError errorWithDomain:CAErrorDomain
+                                         code:57
+                                     userInfo:@{NSLocalizedDescriptionKey: [NSString stringWithFormat:@"Moon Bridge first-use setup requires %@ to be installed and available in your login shell.", missing]}];
+        }
+        return NO;
+    }
+
+    NSString *directory = [self installationDirectory];
+    BOOL isDirectory = NO;
+    if (![[NSFileManager defaultManager] fileExistsAtPath:directory isDirectory:&isDirectory]) {
+        NSString *parent = [directory stringByDeletingLastPathComponent];
+        if (![[NSFileManager defaultManager] createDirectoryAtPath:parent withIntermediateDirectories:YES attributes:@{NSFilePosixPermissions: @0700} error:error]) return NO;
+        chmod(parent.fileSystemRepresentation, 0700);
+        if (!CACommandOutput(gitPath, @[ @"clone", @"--depth", @"1", @"https://github.com/ZhiYi-R/moon-bridge.git", directory ], nil, error)) return NO;
+    } else if (!isDirectory) {
+        if (error) {
+            *error = [NSError errorWithDomain:CAErrorDomain code:58 userInfo:@{NSLocalizedDescriptionKey: @"Moon Bridge install path exists but is not a directory."}];
+        }
+        return NO;
+    }
+    if (!CACommandOutput(goPath, @[ @"build", @"-o", binary, @"./cmd/moonbridge" ], directory, error)) return NO;
+    chmod(binary.fileSystemRepresentation, 0700);
+    return YES;
+}
+
+- (BOOL)writeManagedStateForTask:(NSTask *)task account:(CAThirdPartyAccount *)account error:(NSError **)error {
+    NSDictionary *state = @{
+        @"pid": @(task.processIdentifier),
+        @"binaryPath": [self binaryPath],
+        @"accountID": account.identifier ?: @"",
+        @"endpointURL": account.endpointURL ?: @""
+    };
+    NSData *data = [NSJSONSerialization dataWithJSONObject:state options:0 error:error];
+    return data && CAWritePrivateData(data, [self statePath], error);
+}
+
+- (BOOL)stopManagedBridgeIfOwned:(NSError **)error {
+    NSDictionary *state = [self managedState];
+    if (!state) return YES;
+    if (![self isRecordedStateLive:state]) {
+        [self removeManagedArtifacts];
+        return YES;
+    }
+    BOOL stopped = CAStopOwnedProcess([state[@"pid"] intValue], CAJSONStringValue(state[@"binaryPath"]), error);
+    if (stopped) [self removeManagedArtifacts];
+    return stopped;
+}
+
+- (BOOL)ensureRunningForAccount:(CAThirdPartyAccount *)account apiKey:(NSString *)apiKey error:(NSError **)error {
+    _externallyOwned = NO;
+    _startedManagedBridgeDuringLastEnsure = NO;
+    if (![account isDeepSeekProvider]) return YES;
+    if (!CAMoonBridgeListenAddressForAccount(account, error)) return NO;
+
+    NSDictionary *state = [self managedState];
+    if ([self isRecordedStateLive:state]) {
+        NSString *stateAccountID = CAJSONStringValue(state[@"accountID"]);
+        if ([stateAccountID isEqualToString:account.identifier] && [self isHealthyForAccount:account]) return YES;
+        if (![self stopManagedBridgeIfOwned:error]) return NO;
+    } else if (state) {
+        [self removeManagedArtifacts];
+    }
+
+    if ([self isHealthyForAccount:account]) {
+        _externallyOwned = YES;
+        return YES;
+    }
+    if (![self ensureInstalled:error]) return NO;
+    NSString *configuration = CAMoonBridgeConfigurationForAccount(account, apiKey, error);
+    if (!configuration) return NO;
+    NSData *configurationData = [configuration dataUsingEncoding:NSUTF8StringEncoding];
+    if (!CAWritePrivateData(configurationData, [self configurationPath], error)) return NO;
+
+    NSTask *task = [[NSTask alloc] init];
+    task.launchPath = [self binaryPath];
+    task.arguments = @[ @"--config", [self configurationPath] ];
+    task.currentDirectoryPath = [self installationDirectory];
+    task.standardOutput = [NSPipe pipe];
+    task.standardError = [NSPipe pipe];
+    @try {
+        [task launch];
+    } @catch (NSException *exception) {
+        [self removeManagedArtifacts];
+        if (error) {
+            *error = [NSError errorWithDomain:CAErrorDomain code:59 userInfo:@{NSLocalizedDescriptionKey: exception.reason ?: @"Failed to launch Moon Bridge."}];
+        }
+        return NO;
+    }
+    if (![self writeManagedStateForTask:task account:account error:error] || ![self waitUntilHealthyForAccount:account task:task error:error]) {
+        CAStopOwnedProcess(task.processIdentifier, [self binaryPath], nil);
+        [self removeManagedArtifacts];
+        return NO;
+    }
+    _startedManagedBridgeDuringLastEnsure = YES;
+    return YES;
 }
 
 @end
@@ -887,15 +1383,15 @@ static BOOL CAStringHasAnyPrefix(NSString *value, NSArray<NSString *> *prefixes)
     task.standardError = [NSPipe pipe];
     NSError *launchError = nil;
     [task launchAndReturnError:&launchError];
-    if (launchError) return nil;
+    if (launchError) return CANVMExecutablePathForCommand(command);
     [task waitUntilExit];
-    if (task.terminationStatus != 0) return nil;
+    if (task.terminationStatus != 0) return CANVMExecutablePathForCommand(command);
     NSData *data = [[pipe fileHandleForReading] readDataToEndOfFile];
     NSString *path = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
     path = [path stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-    if (path.length == 0) return nil;
+    if (path.length == 0) return CANVMExecutablePathForCommand(command);
     BOOL isDir = NO;
-    if (![[NSFileManager defaultManager] fileExistsAtPath:path isDirectory:&isDir] || isDir) return nil;
+    if (![[NSFileManager defaultManager] fileExistsAtPath:path isDirectory:&isDir] || isDir) return CANVMExecutablePathForCommand(command);
     return path;
 }
 
@@ -937,7 +1433,7 @@ static BOOL CAStringHasAnyPrefix(NSString *value, NSArray<NSString *> *prefixes)
             *error = [NSError errorWithDomain:CAErrorDomain
                                          code:10
                                      userInfo:@{NSLocalizedDescriptionKey:
-                                                    [NSString stringWithFormat:@"CLI not found at %@", self.binaryPath]}];
+                                                    @"`codex-auth` was not found. Install it or make it available in your login shell or NVM installation."}];
         }
         return NO;
     }
@@ -1294,6 +1790,7 @@ static BOOL CAStringHasAnyPrefix(NSString *value, NSArray<NSString *> *prefixes)
 @property(nonatomic, assign) CANotificationStatus notificationStatus;
 @property(nonatomic, copy) NSArray<CAThirdPartyAccount *> *thirdPartyAccounts;
 @property(nonatomic, copy) NSString *activeThirdPartyAccountID;
+@property(nonatomic, strong) CAMoonBridgeManager *moonBridgeManager;
 @end
 
 @implementation AppDelegate
@@ -1402,6 +1899,7 @@ static BOOL CAStringHasAnyPrefix(NSString *value, NSArray<NSString *> *prefixes)
 
 - (void)applicationDidFinishLaunching:(NSNotification *)notification {
     self.manager = [[CodexAuthManager alloc] init];
+    self.moonBridgeManager = [[CAMoonBridgeManager alloc] init];
     self.status = [[CAStatusSnapshot alloc] init];
     self.accounts = @[];
     self.thirdPartyAccounts = @[];
@@ -1417,6 +1915,28 @@ static BOOL CAStringHasAnyPrefix(NSString *value, NSArray<NSString *> *prefixes)
     [self refreshNotificationSettings];
     [self refresh];
     [self scheduleTimer];
+
+    CAThirdPartyAccount *activeThirdParty = [self activeThirdPartyAccount];
+    if ([activeThirdParty isDeepSeekProvider]) {
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+            NSError *error = nil;
+            NSString *apiKey = [CAThirdPartyAccountStore apiKeyForAccount:activeThirdParty error:&error];
+            BOOL started = apiKey && [self.moonBridgeManager ensureRunningForAccount:activeThirdParty apiKey:apiKey error:&error];
+            if (!started) {
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    self.lastError = error.localizedDescription;
+                    [self rebuildMenu];
+                });
+            }
+        });
+    }
+}
+
+- (void)applicationWillTerminate:(NSNotification *)notification {
+    NSError *error = nil;
+    if (![self.moonBridgeManager stopManagedBridgeIfOwned:&error] && error) {
+        NSLog(@"Failed to stop managed Moon Bridge during termination: %@", error.localizedDescription);
+    }
 }
 
 - (void)refresh {
@@ -1531,10 +2051,30 @@ static BOOL CAStringHasAnyPrefix(NSString *value, NSArray<NSString *> *prefixes)
 
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         NSError *error = nil;
-        BOOL restoredOfficial = [self restoreOfficialCodexConfigIfNeeded:&error];
-        BOOL success = restoredOfficial;
-        if (restoredOfficial) {
+        CAThirdPartyAccount *previousThirdParty = [self activeThirdPartyAccount];
+        NSString *previousAPIKey = nil;
+        BOOL success = YES;
+        if ([previousThirdParty isDeepSeekProvider]) {
+            previousAPIKey = [CAThirdPartyAccountStore apiKeyForAccount:previousThirdParty error:&error];
+            success = previousAPIKey != nil;
+        }
+        if (success && [previousThirdParty isDeepSeekProvider]) {
+            success = [self.moonBridgeManager stopManagedBridgeIfOwned:&error];
+        }
+        BOOL restoredOfficial = success && [self restoreOfficialCodexConfigIfNeeded:&error];
+        success = restoredOfficial;
+        if (success) {
             success = [self.manager switchAccount:account error:&error];
+        }
+        if (!success && [previousThirdParty isDeepSeekProvider] && previousAPIKey.length > 0 && !restoredOfficial) {
+            NSError *restartError = nil;
+            if (![self.moonBridgeManager ensureRunningForAccount:previousThirdParty apiKey:previousAPIKey error:&restartError]) {
+                NSString *message = error.localizedDescription ?: @"Failed to restore the official Codex configuration.";
+                error = [NSError errorWithDomain:CAErrorDomain
+                                             code:61
+                                         userInfo:@{NSLocalizedDescriptionKey:
+                                                        [message stringByAppendingFormat:@" Previous Moon Bridge restart also failed: %@", restartError.localizedDescription ?: @"unknown error"]}];
+            }
         }
         dispatch_async(dispatch_get_main_queue(), ^{
             self.switching = NO;
@@ -1558,9 +2098,9 @@ static BOOL CAStringHasAnyPrefix(NSString *value, NSArray<NSString *> *prefixes)
     CAThirdPartyAccount *account = [self thirdPartyAccountWithID:identifier];
     if (!account) return;
 
-    if ([account isChatCompletionsOnly]) {
+    if (![account isResponsesAPICompatible] && ![account isDeepSeekProvider]) {
         [self showAlertWithTitle:@"Local Routing Required"
-                         message:@"This provider uses Chat Completions. Local routing is required and is not supported yet. This version only enables Responses API compatible providers."];
+                         message:@"This provider uses Chat Completions. Start a local Responses API router first, then use its local /v1 URL as the API Request URL."];
         return;
     }
 
@@ -1580,8 +2120,21 @@ static BOOL CAStringHasAnyPrefix(NSString *value, NSArray<NSString *> *prefixes)
 
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         NSError *error = nil;
+        CAThirdPartyAccount *previousAccount = [self activeThirdPartyAccount];
+        BOOL previousIsDeepSeek = [previousAccount isDeepSeekProvider];
+        BOOL targetIsDeepSeek = [account isDeepSeekProvider];
+        NSString *previousAPIKey = nil;
+        if (previousIsDeepSeek && ![previousAccount.identifier isEqualToString:account.identifier]) {
+            previousAPIKey = [CAThirdPartyAccountStore apiKeyForAccount:previousAccount error:&error];
+        }
         NSString *apiKey = [CAThirdPartyAccountStore apiKeyForAccount:account error:&error];
-        BOOL success = apiKey != nil;
+        BOOL success = apiKey != nil && (!previousIsDeepSeek || previousAPIKey != nil || [previousAccount.identifier isEqualToString:account.identifier]);
+        if (success && targetIsDeepSeek) {
+            success = [self.moonBridgeManager ensureRunningForAccount:account apiKey:apiKey error:&error];
+        } else if (success && previousIsDeepSeek) {
+            success = [self.moonBridgeManager stopManagedBridgeIfOwned:&error];
+        }
+        BOOL startedTargetMoonBridge = self.moonBridgeManager.startedManagedBridgeDuringLastEnsure;
         if (success) {
             NSString *configText = [CACodexConfigManager readConfigText:&error];
             success = configText != nil;
@@ -1598,15 +2151,34 @@ static BOOL CAStringHasAnyPrefix(NSString *value, NSArray<NSString *> *prefixes)
 
                 success = [CACodexConfigManager backupOfficialAuthReplacingExisting:creatingOfficialSnapshot
                                                                                 error:&error];
-                NSString *updated = [CACodexConfigManager configTextByApplyingThirdPartyAccount:account
+                CAThirdPartyAccount *codexAccount = targetIsDeepSeek ? CAMoonBridgeCodexAccount(account) : account;
+                NSString *updated = codexAccount ? [CACodexConfigManager configTextByApplyingThirdPartyAccount:codexAccount
                                                                                          apiKey:apiKey
                                                                                          toText:configText
-                                                                                          error:&error];
+                                                                                          error:&error] : nil;
                 success = success && updated != nil;
                 if (success) {
                     success = [CACodexConfigManager writeThirdPartyConfigText:updated
                                                                        apiKey:apiKey
                                                                         error:&error];
+                }
+            }
+        }
+
+        if (!success) {
+            if (targetIsDeepSeek && startedTargetMoonBridge) {
+                [self.moonBridgeManager stopManagedBridgeIfOwned:nil];
+            }
+            if (previousIsDeepSeek &&
+                ![previousAccount.identifier isEqualToString:account.identifier] &&
+                previousAPIKey.length > 0) {
+                NSError *restoreError = nil;
+                if (![self.moonBridgeManager ensureRunningForAccount:previousAccount apiKey:previousAPIKey error:&restoreError]) {
+                    NSString *message = error.localizedDescription ?: @"Failed to switch the DeepSeek provider.";
+                    error = [NSError errorWithDomain:CAErrorDomain
+                                                 code:60
+                                             userInfo:@{NSLocalizedDescriptionKey:
+                                                            [message stringByAppendingFormat:@" Previous Moon Bridge restart also failed: %@", restoreError.localizedDescription ?: @"unknown error"]}];
                 }
             }
         }
@@ -1647,6 +2219,9 @@ static BOOL CAStringHasAnyPrefix(NSString *value, NSArray<NSString *> *prefixes)
 
 - (NSString *)inferAPIFormatForProviderName:(NSString *)providerName endpointURL:(NSString *)endpointURL {
     NSString *combined = [[NSString stringWithFormat:@"%@ %@", providerName ?: @"", endpointURL ?: @""] lowercaseString];
+    if (CAEndpointIsLocalResponsesProxy(endpointURL)) {
+        return CAThirdPartyAPIFormatResponsesValue;
+    }
     if ([combined containsString:@"chat/completions"] ||
         [combined containsString:@"deepseek"] ||
         [combined containsString:@"kimi"] ||
@@ -1656,20 +2231,22 @@ static BOOL CAStringHasAnyPrefix(NSString *value, NSArray<NSString *> *prefixes)
     return CAThirdPartyAPIFormatResponsesValue;
 }
 
-- (BOOL)providerNameRequiresCompatibilityWarning:(NSString *)providerName {
+- (BOOL)providerNameRequiresCompatibilityWarning:(NSString *)providerName endpointURL:(NSString *)endpointURL {
+    if ([[CATrimString(providerName) lowercaseString] containsString:@"deepseek"]) return NO;
+    if (CAEndpointIsLocalResponsesProxy(endpointURL)) return NO;
     NSString *normalized = [CATrimString(providerName) lowercaseString];
     return [normalized containsString:@"deepseek"] || [normalized containsString:@"kimi"];
 }
 
 - (NSTextField *)thirdPartyCompatibilityDescriptionWithFrame:(NSRect)frame {
-    NSString *text = @"Initial support is for OpenAI Responses API compatible providers.\n"
-                     "DeepSeek / Kimi-style Chat Completions providers require local routing and cannot be enabled yet.";
+    NSString *text = @"Use a Responses API compatible provider URL.\n"
+                     "For DeepSeek, use https://api.deepseek.com/v1; the app starts Moon Bridge automatically.";
     NSMutableAttributedString *attributed = [[NSMutableAttributedString alloc] initWithString:text
                                                                                    attributes:@{
                                                                                        NSFontAttributeName: [NSFont systemFontOfSize:13],
                                                                                        NSForegroundColorAttributeName: [NSColor labelColor]
                                                                                    }];
-    NSRange emphasizedRange = [text rangeOfString:@"DeepSeek / Kimi"];
+    NSRange emphasizedRange = [text rangeOfString:@"DeepSeek"];
     if (emphasizedRange.location != NSNotFound) {
         [attributed addAttribute:NSFontAttributeName
                           value:[NSFont boldSystemFontOfSize:13]
@@ -1727,13 +2304,35 @@ static BOOL CAStringHasAnyPrefix(NSString *value, NSArray<NSString *> *prefixes)
     return field;
 }
 
+- (BOOL)rewriteConfigForThirdPartyAccount:(CAThirdPartyAccount *)account apiKey:(NSString *)apiKey error:(NSError **)error {
+    NSString *configText = [CACodexConfigManager readConfigText:error];
+    if (!configText) return NO;
+    CAThirdPartyAccount *codexAccount = [account isDeepSeekProvider] ? CAMoonBridgeCodexAccount(account) : account;
+    if (!codexAccount) return NO;
+    NSString *updated = [CACodexConfigManager configTextByApplyingThirdPartyAccount:codexAccount
+                                                                             apiKey:apiKey
+                                                                             toText:configText
+                                                                              error:error];
+    if (!updated) return NO;
+    return [CACodexConfigManager writeThirdPartyConfigText:updated apiKey:apiKey error:error];
+}
+
+- (BOOL)restoreActiveDeepSeekRouteForAccount:(CAThirdPartyAccount *)account apiKey:(NSString *)apiKey error:(NSError **)error {
+    if (![self.moonBridgeManager ensureRunningForAccount:account apiKey:apiKey error:error]) return NO;
+    if ([self rewriteConfigForThirdPartyAccount:account apiKey:apiKey error:error]) return YES;
+    [self.moonBridgeManager stopManagedBridgeIfOwned:nil];
+    return NO;
+}
+
 - (BOOL)deleteThirdPartyAccount:(CAThirdPartyAccount *)account error:(NSError **)error {
     BOOL deletingActive = [self.activeThirdPartyAccountID isEqualToString:account.identifier];
-    if (deletingActive && ![self restoreOfficialCodexConfigIfNeeded:error]) {
-        return NO;
-    }
+    NSString *previousAPIKey = nil;
     if (deletingActive) {
-        [self setActiveThirdPartyAccountIDAndPersist:nil];
+        previousAPIKey = [CAThirdPartyAccountStore apiKeyForAccount:account error:error];
+        if (!previousAPIKey) return NO;
+    }
+    if (deletingActive && [account isDeepSeekProvider]) {
+        if (![self.moonBridgeManager stopManagedBridgeIfOwned:error]) return NO;
     }
 
     NSMutableArray<CAThirdPartyAccount *> *remaining = [NSMutableArray array];
@@ -1742,7 +2341,18 @@ static BOOL CAStringHasAnyPrefix(NSString *value, NSArray<NSString *> *prefixes)
             [remaining addObject:candidate];
         }
     }
-    if (![CAThirdPartyAccountStore saveAccounts:remaining error:error]) return NO;
+    if (![CAThirdPartyAccountStore saveAccounts:remaining error:error]) {
+        if (deletingActive && [account isDeepSeekProvider]) {
+            NSError *restoreError = nil;
+            if (![self.moonBridgeManager ensureRunningForAccount:account apiKey:previousAPIKey error:&restoreError] && error && *error) {
+                *error = [NSError errorWithDomain:CAErrorDomain
+                                             code:63
+                                         userInfo:@{NSLocalizedDescriptionKey:
+                                                        [(*error).localizedDescription stringByAppendingFormat:@" DeepSeek route rollback also failed: %@", restoreError.localizedDescription ?: @"unknown error"]}];
+            }
+        }
+        return NO;
+    }
     NSError *keyError = nil;
     if (![CAThirdPartyAccountStore deleteAPIKeyForAccount:account error:&keyError]) {
         NSError *rollbackError = nil;
@@ -1757,8 +2367,34 @@ static BOOL CAStringHasAnyPrefix(NSString *value, NSArray<NSString *> *prefixes)
                                          code:35
                                      userInfo:@{NSLocalizedDescriptionKey: message}];
         }
+        if (deletingActive && [account isDeepSeekProvider]) {
+            NSError *restoreError = nil;
+            if (![self.moonBridgeManager ensureRunningForAccount:account apiKey:previousAPIKey error:&restoreError] && error && *error) {
+                *error = [NSError errorWithDomain:CAErrorDomain
+                                             code:64
+                                         userInfo:@{NSLocalizedDescriptionKey:
+                                                        [(*error).localizedDescription stringByAppendingFormat:@" DeepSeek route rollback also failed: %@", restoreError.localizedDescription ?: @"unknown error"]}];
+            }
+        }
         return NO;
     }
+    if (deletingActive && ![self restoreOfficialCodexConfigIfNeeded:error]) {
+        NSError *rollbackError = nil;
+        BOOL accountsRolledBack = [CAThirdPartyAccountStore saveAccounts:self.thirdPartyAccounts error:&rollbackError];
+        BOOL keyRolledBack = [CAThirdPartyAccountStore saveAPIKey:previousAPIKey ?: @"" forAccount:account error:&rollbackError];
+        BOOL bridgeRolledBack = YES;
+        if ([account isDeepSeekProvider]) {
+            bridgeRolledBack = [self.moonBridgeManager ensureRunningForAccount:account apiKey:previousAPIKey error:&rollbackError];
+        }
+        if (error && *error && (!accountsRolledBack || !keyRolledBack || !bridgeRolledBack)) {
+            *error = [NSError errorWithDomain:CAErrorDomain
+                                         code:62
+                                     userInfo:@{NSLocalizedDescriptionKey:
+                                                    [(*error).localizedDescription stringByAppendingFormat:@" Delete rollback also failed: %@", rollbackError.localizedDescription ?: @"unknown error"]}];
+        }
+        return NO;
+    }
+    if (deletingActive) [self setActiveThirdPartyAccountIDAndPersist:nil];
     self.thirdPartyAccounts = remaining;
     return YES;
 }
@@ -1766,14 +2402,7 @@ static BOOL CAStringHasAnyPrefix(NSString *value, NSArray<NSString *> *prefixes)
 - (BOOL)rewriteConfigForActiveThirdPartyAccount:(CAThirdPartyAccount *)account error:(NSError **)error {
     NSString *apiKey = [CAThirdPartyAccountStore apiKeyForAccount:account error:error];
     if (!apiKey) return NO;
-    NSString *configText = [CACodexConfigManager readConfigText:error];
-    if (!configText) return NO;
-    NSString *updated = [CACodexConfigManager configTextByApplyingThirdPartyAccount:account
-                                                                             apiKey:apiKey
-                                                                             toText:configText
-                                                                              error:error];
-    if (!updated) return NO;
-    return [CACodexConfigManager writeThirdPartyConfigText:updated apiKey:apiKey error:error];
+    return [self rewriteConfigForThirdPartyAccount:account apiKey:apiKey error:error];
 }
 
 - (void)showThirdPartyAccountFormForAccount:(CAThirdPartyAccount *)existingAccount {
@@ -1899,7 +2528,7 @@ static BOOL CAStringHasAnyPrefix(NSString *value, NSArray<NSString *> *prefixes)
         }
 
         NSString *normalizedProviderName = [providerName lowercaseString];
-        if ([self providerNameRequiresCompatibilityWarning:providerName] &&
+        if ([self providerNameRequiresCompatibilityWarning:providerName endpointURL:endpointURL] &&
             ![acknowledgedProviderName isEqualToString:normalizedProviderName]) {
             if (![self confirmSavingProviderWithoutResponsesSupport:providerName]) {
                 continue;
@@ -1936,16 +2565,42 @@ static BOOL CAStringHasAnyPrefix(NSString *value, NSArray<NSString *> *prefixes)
         }
 
         NSError *saveError = nil;
+        BOOL editingActiveAccount = existingAccount && [self.activeThirdPartyAccountID isEqualToString:account.identifier];
+        BOOL editingActiveDeepSeek = editingActiveAccount && [existingAccount isDeepSeekProvider];
         NSString *previousAPIKey = nil;
-        if (existingAccount && apiKey.length > 0) {
+        if (existingAccount && (apiKey.length > 0 || editingActiveDeepSeek)) {
             previousAPIKey = [CAThirdPartyAccountStore apiKeyForAccount:existingAccount error:&saveError];
             if (!previousAPIKey) {
                 [self showAlertWithTitle:@"Save Failed" message:saveError.localizedDescription ?: @"Failed to read the existing API Key."];
                 continue;
             }
         }
+        NSString *effectiveAPIKey = apiKey.length > 0 ? apiKey : previousAPIKey;
+
+        if (editingActiveDeepSeek) {
+            BOOL prepared = [self.moonBridgeManager stopManagedBridgeIfOwned:&saveError];
+            prepared = prepared && [self.moonBridgeManager ensureRunningForAccount:account apiKey:effectiveAPIKey error:&saveError];
+            prepared = prepared && [self rewriteConfigForThirdPartyAccount:account apiKey:effectiveAPIKey error:&saveError];
+            if (!prepared) {
+                [self.moonBridgeManager stopManagedBridgeIfOwned:nil];
+                NSError *rollbackError = nil;
+                if (![self restoreActiveDeepSeekRouteForAccount:existingAccount apiKey:previousAPIKey error:&rollbackError]) {
+                    NSString *message = saveError.localizedDescription ?: @"Failed to update Moon Bridge.";
+                    saveError = [NSError errorWithDomain:CAErrorDomain
+                                                     code:65
+                                                 userInfo:@{NSLocalizedDescriptionKey:
+                                                                [message stringByAppendingFormat:@" Previous DeepSeek route rollback also failed: %@", rollbackError.localizedDescription ?: @"unknown error"]}];
+                }
+                [self showAlertWithTitle:@"Save Failed" message:saveError.localizedDescription ?: @"Failed to update Moon Bridge."];
+                continue;
+            }
+        }
 
         if (![CAThirdPartyAccountStore saveAccounts:nextAccounts error:&saveError]) {
+            if (editingActiveDeepSeek) {
+                [self.moonBridgeManager stopManagedBridgeIfOwned:nil];
+                [self restoreActiveDeepSeekRouteForAccount:existingAccount apiKey:previousAPIKey error:nil];
+            }
             [self showAlertWithTitle:@"Save Failed" message:saveError.localizedDescription ?: @"Failed to save Third Party account."];
             continue;
         }
@@ -1957,11 +2612,15 @@ static BOOL CAStringHasAnyPrefix(NSString *value, NSArray<NSString *> *prefixes)
             } else {
                 [CAThirdPartyAccountStore deleteAPIKeyForAccount:account error:nil];
             }
+            if (editingActiveDeepSeek) {
+                [self.moonBridgeManager stopManagedBridgeIfOwned:nil];
+                [self restoreActiveDeepSeekRouteForAccount:existingAccount apiKey:previousAPIKey error:nil];
+            }
             [self showAlertWithTitle:@"Save Failed" message:saveError.localizedDescription ?: @"Failed to save the API Key."];
             continue;
         }
 
-        if ([self.activeThirdPartyAccountID isEqualToString:account.identifier]) {
+        if (editingActiveAccount && !editingActiveDeepSeek) {
             NSError *rewriteError = nil;
             if (![self rewriteConfigForActiveThirdPartyAccount:account error:&rewriteError]) {
                 NSError *rollbackError = nil;
@@ -1980,8 +2639,13 @@ static BOOL CAStringHasAnyPrefix(NSString *value, NSArray<NSString *> *prefixes)
                 [self showAlertWithTitle:@"Save Failed" message:message];
                 continue;
             }
+        }
+
+        if (editingActiveAccount) {
             [self showAlertWithTitle:@"Third Party Account Updated"
-                             message:@"The active Codex provider config has been rewritten. Restart existing Codex sessions to reload the updated values."];
+                             message:editingActiveDeepSeek
+                                 ? @"Moon Bridge has been restarted with the updated DeepSeek settings. Restart existing Codex sessions to reload the updated values."
+                                 : @"The active Codex provider config has been rewritten. Restart existing Codex sessions to reload the updated values."];
         }
 
         self.thirdPartyAccounts = nextAccounts;
@@ -2412,7 +3076,8 @@ static BOOL CAStringHasAnyPrefix(NSString *value, NSArray<NSString *> *prefixes)
     NSMutableAttributedString *result = [[NSMutableAttributedString alloc] initWithString:[NSString stringWithFormat:@"%@\t", account.remark]
                                                                                 attributes:leftAttributes];
     [result appendAttributedString:[[NSAttributedString alloc] initWithString:@" " attributes:leftAttributes]];
-    [result appendAttributedString:([account isChatCompletionsOnly] ? [self requiresRoutingTagAttributedString] : [self thirdPartyTagAttributedString])];
+    BOOL requiresLocalRouting = [account isChatCompletionsOnly] && ![account isDeepSeekProvider];
+    [result appendAttributedString:(requiresLocalRouting ? [self requiresRoutingTagAttributedString] : [self thirdPartyTagAttributedString])];
     return result;
 }
 
@@ -2788,7 +3453,32 @@ static BOOL CAStringHasAnyPrefix(NSString *value, NSArray<NSString *> *prefixes)
 
 @end
 
+@interface AppDelegate (RoutingDisplayVerification)
+- (NSAttributedString *)switchAccountTitleForThirdPartyAccount:(CAThirdPartyAccount *)account;
+@end
+
 static int CARunConfigRoundTripVerification(void) {
+    NSError *commandError = nil;
+    NSString *verboseOutput = CACommandOutput(@"/bin/sh",
+                                              @[ @"-c", @"i=0; while [ $i -lt 1000 ]; do printf 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\\n'; i=$((i + 1)); done" ],
+                                              nil,
+                                              &commandError);
+    if (!verboseOutput || commandError || verboseOutput.length < 100000) {
+        fprintf(stderr, "High-output command verification failed: %s\\n", commandError.localizedDescription.UTF8String ?: "");
+        return 1;
+    }
+
+    NSString *nvmCodexAuth = CANVMExecutablePathForCommand(@"codex-auth");
+    if (nvmCodexAuth.length == 0 || ![[NSFileManager defaultManager] isExecutableFileAtPath:nvmCodexAuth]) {
+        fprintf(stderr, "NVM codex-auth resolution verification failed.\\n");
+        return 1;
+    }
+    CodexAuthManager *finderLikeManager = [[CodexAuthManager alloc] initWithBinaryPath:nil nodePath:nil];
+    if (![finderLikeManager.binaryPath isEqualToString:nvmCodexAuth]) {
+        fprintf(stderr, "Finder-like codex-auth resolver did not fall back to NVM.\\n");
+        return 1;
+    }
+
     CAThirdPartyAccount *account = [[CAThirdPartyAccount alloc] init];
     account.identifier = @"verify";
     account.remark = @"verify-provider";
@@ -2801,8 +3491,13 @@ static int CARunConfigRoundTripVerification(void) {
     account.codexProviderID = @"codex_auth_menu_verify";
 
     NSString *original = @"sandbox_mode = \"workspace-write\"\n"
-                         "model_provider = \"openai\"\n"
-                         "model = \"gpt-5.5\"\n"
+                         "model_provider = \"custom\"\n"
+                         "model = \"gpt-5.6-terra\"\n"
+                         "\n"
+                         "[model_providers.custom]\n"
+                         "name = \"OpenAI\"\n"
+                         "requires_openai_auth = true\n"
+                         "wire_api = \"responses\"\n"
                          "\n"
                          "[model_providers.codex_auth_menu_deleted]\n"
                          "name = \"stale\"\n"
@@ -2817,26 +3512,106 @@ static int CARunConfigRoundTripVerification(void) {
                                                                              toText:original
                                                                               error:&error];
     if (!applied ||
-        ![applied containsString:@"model_provider = \"codex_auth_menu_verify\""] ||
-        ![applied containsString:@"[model_providers.codex_auth_menu_verify]"] ||
+        ![applied containsString:@"model_provider = \"custom\""] ||
+        ![applied containsString:@"[model_providers.custom]"] ||
+        [applied containsString:@"[model_providers.codex_auth_menu_verify]"] ||
+        [applied containsString:@"name = \"OpenAI\""] ||
         [applied containsString:@"codex_auth_menu_deleted"] ||
         [applied containsString:@"experimental_bearer_token"] ||
         ![applied containsString:@"[mcp_servers.demo]"]) {
-        fprintf(stderr, "Third Party config apply verification failed: %s\n", error.localizedDescription.UTF8String ?: "");
+        fprintf(stderr, "Third Party config did not replace the official custom provider: %s\n", error.localizedDescription.UTF8String ?: "");
         return 1;
     }
 
     NSString *restored = [CACodexConfigManager configTextByRestoringSnapshot:snapshot
                                                          removingProviderIDs:@[account.codexProviderID]
                                                                     fromText:applied];
-    if (![restored containsString:@"model_provider = \"openai\""] ||
-        ![restored containsString:@"model = \"gpt-5.5\""] ||
+    if (![restored containsString:@"model_provider = \"custom\""] ||
+        ![restored containsString:@"model = \"gpt-5.6-terra\""] ||
+        ![restored containsString:@"[model_providers.custom]\nname = \"OpenAI\""] ||
+        ![restored containsString:@"requires_openai_auth = true"] ||
         ![restored containsString:@"[mcp_servers.demo]"] ||
         [restored containsString:@"codex_auth_menu_verify"] ||
         [restored containsString:@"disable_response_storage"]) {
         fprintf(stderr, "Official config restore verification failed.\n");
         return 1;
     }
+
+    CAThirdPartyAccount *deepSeekMoonBridge = [[CAThirdPartyAccount alloc] init];
+    deepSeekMoonBridge.identifier = @"deepseek-moonbridge";
+    deepSeekMoonBridge.remark = @"deepseek-v4-flash";
+    deepSeekMoonBridge.providerName = @"DeepSeek";
+    deepSeekMoonBridge.endpointURL = @"http://127.0.0.1:38440/v1";
+    deepSeekMoonBridge.endpointType = CAThirdPartyEndpointBaseURLValue;
+    deepSeekMoonBridge.modelName = @"moonbridge";
+    // Existing saved DeepSeek accounts were classified as Chat Completions.
+    // Moon Bridge converts them to Codex's Responses API, so they must switch.
+    deepSeekMoonBridge.apiFormat = CAThirdPartyAPIFormatChatValue;
+    deepSeekMoonBridge.keychainIdentifier = @"deepseek-moonbridge";
+    deepSeekMoonBridge.codexProviderID = @"codex_auth_menu_deepseek";
+    AppDelegate *menuDelegate = [[AppDelegate alloc] init];
+    NSAttributedString *deepSeekTitle = [menuDelegate switchAccountTitleForThirdPartyAccount:deepSeekMoonBridge];
+    if ([[deepSeekTitle string] containsString:@"Requires Routing"]) {
+        fprintf(stderr, "DeepSeek account list incorrectly requires local routing.\n");
+        return 1;
+    }
+    error = nil;
+    NSString *deepSeekApplied = [CACodexConfigManager configTextByApplyingThirdPartyAccount:deepSeekMoonBridge
+                                                                                       apiKey:@"sk-verify"
+                                                                                       toText:@""
+                                                                                        error:&error];
+    if (!deepSeekApplied ||
+        ![deepSeekApplied containsString:@"model_provider = \"custom\""] ||
+        ![deepSeekApplied containsString:@"[model_providers.custom]"] ||
+        ![deepSeekApplied containsString:@"model = \"moonbridge\""] ||
+        ![deepSeekApplied containsString:@"base_url = \"http://127.0.0.1:38440/v1\""]) {
+        fprintf(stderr, "DeepSeek Moon Bridge configuration verification failed: %s\\n", error.localizedDescription.UTF8String ?: "");
+        return 1;
+    }
+
+    error = nil;
+    NSString *moonBridgeConfig = CAMoonBridgeConfigurationForAccount(deepSeekMoonBridge, @"sk-verify", &error);
+    if (!moonBridgeConfig ||
+        ![moonBridgeConfig containsString:@"addr: \"127.0.0.1:38440\""] ||
+        ![moonBridgeConfig containsString:@"base_url: \"https://api.deepseek.com/anthropic\""] ||
+        ![moonBridgeConfig containsString:@"model: deepseek-v4-flash"]) {
+        fprintf(stderr, "Moon Bridge configuration generation verification failed: %s\\n", error.localizedDescription.UTF8String ?: "");
+        return 1;
+    }
+    CAThirdPartyAccount *directDeepSeek = [CAThirdPartyAccount accountFromDictionary:[deepSeekMoonBridge dictionaryRepresentation]];
+    directDeepSeek.endpointURL = @"https://api.deepseek.com/anthropic";
+    error = nil;
+    NSString *directDeepSeekConfig = CAMoonBridgeConfigurationForAccount(directDeepSeek, @"sk-verify", &error);
+    if (!directDeepSeekConfig || ![directDeepSeekConfig containsString:@"addr: \"127.0.0.1:38440\""]) {
+        fprintf(stderr, "Direct DeepSeek endpoint should receive a managed local Moon Bridge listener.\\n");
+        return 1;
+    }
+    CAThirdPartyAccount *directDeepSeekCodex = CAMoonBridgeCodexAccount(directDeepSeek);
+    error = nil;
+    NSString *directDeepSeekCodexConfig = [CACodexConfigManager configTextByApplyingThirdPartyAccount:directDeepSeekCodex
+                                                                                                  apiKey:@"sk-verify"
+                                                                                                  toText:@""
+                                                                                                   error:&error];
+    if (!directDeepSeekCodexConfig ||
+        ![directDeepSeekCodexConfig containsString:@"model_provider = \"custom\""] ||
+        ![directDeepSeekCodexConfig containsString:@"[model_providers.custom]"] ||
+        ![directDeepSeekCodexConfig containsString:@"model = \"moonbridge\""] ||
+        ![directDeepSeekCodexConfig containsString:@"base_url = \"http://127.0.0.1:38440/v1\""]) {
+        fprintf(stderr, "Direct DeepSeek account was not rewritten to the Moon Bridge Codex route.\\n");
+        return 1;
+    }
+
+    NSTask *ownedSleep = [[NSTask alloc] init];
+    ownedSleep.launchPath = @"/bin/sleep";
+    ownedSleep.arguments = @[ @"60" ];
+    [ownedSleep launch];
+    error = nil;
+    if (!CAStopOwnedProcess(ownedSleep.processIdentifier, @"/bin/sleep", &error)) {
+        fprintf(stderr, "Owned Moon Bridge process stop verification failed: %s\\n", error.localizedDescription.UTF8String ?: "");
+        [ownedSleep terminate];
+        return 1;
+    }
+    [ownedSleep waitUntilExit];
 
     printf("Config roundtrip verification passed.\n");
     return 0;
